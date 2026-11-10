@@ -1,0 +1,39 @@
+name: release
+
+# Push a tag such as v0.1.0 (or v0.1.0-rc.1 for a pre-release) to publish.
+# The tag must match BRIDGE_VERSION in src\winfsp-pipe-bridge.c.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Get the WinFsp SDK
+        shell: pwsh
+        run: |
+          $sdk = ./scripts/get-winfsp-sdk.ps1
+          "WINFSP_SDK=$sdk" >> $env:GITHUB_ENV
+
+      - name: Build and package
+        shell: pwsh
+        run: ./scripts/release.ps1 -Tag $env:GITHUB_REF_NAME -WinFsp $env:WINFSP_SDK
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $zip = Get-ChildItem dist -Filter *.zip | Select-Object -First 1
+          $ghArgs = @($tag, $zip.FullName, 'dist/SHA256SUMS', '--title', "winfsp-pipe-bridge $($tag.Substring(1))", '--notes-file', 'dist/RELEASE_NOTES.md', '--verify-tag')
+          if ($tag -match '-') { $ghArgs += '--prerelease' }
+          gh release create @ghArgs

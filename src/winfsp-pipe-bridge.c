@@ -15,6 +15,7 @@
 #include <stdarg.h>
 #include <sddl.h>
 
+#define BRIDGE_VERSION "0.1.0"   // scripts/release.ps1 reads this; release tags must match it
 #define DEFAULT_PATH L"\\property-file.env"
 #define DENIED_PREFIX "Access denied: you do not have permission"
 #define MAX_DEPTH 32
@@ -301,6 +302,10 @@ static BOOL WINAPI on_ctrl(DWORD t) { (void)t; SetEvent(g_stop); return TRUE; }
 
 int wmain(int argc, wchar_t **argv)
 {
+    if (argc == 2 && (0 == wcscmp(argv[1], L"--version") || 0 == wcscmp(argv[1], L"-V"))) {
+        printf("winfsp-pipe-bridge %s\n", BRIDGE_VERSION);
+        return 0;
+    }
     if (argc < 3 || argc > 4) {
         fwprintf(stderr,
             L"usage: winfsp-pipe-bridge <\\\\.\\pipe\\name> <mountpoint: K: or *> [path on the volume]\n"
@@ -312,6 +317,11 @@ int wmain(int argc, wchar_t **argv)
     if (!parse_path(argc == 4 ? argv[3] : DEFAULT_PATH, &why)) {
         fprintf(stderr, "invalid path: %s\n", why);
         return 2;
+    }
+    // winfsp-x64.dll is delay-loaded so a missing WinFsp gives this message, not a loader error.
+    if (!NT_SUCCESS(FspLoad(0))) {
+        fprintf(stderr, "WinFsp is not installed. Get it from https://winfsp.dev/ or https://github.com/winfsp/winfsp/releases\n");
+        return 1;
     }
     wcsncpy_s(g_pipe, 512, argv[1], _TRUNCATE);
     FILETIME ft; GetSystemTimeAsFileTime(&ft);
