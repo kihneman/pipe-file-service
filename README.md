@@ -41,15 +41,34 @@ caller's PID and executable path, which WinFsp reports at open time.
 
 ## Build
 
-Requires Visual Studio C++ build tools and WinFsp installed **with the
-Developer feature** (SDK headers and import library). From a Developer
-PowerShell:
+Requires the Visual Studio C++ x64 build tools (`build.ps1` finds them itself)
+and the WinFsp SDK (headers and import library):
 
 ```powershell
-.\build.ps1
+.\build.ps1                              # uses an installed WinFsp (Developer feature)
+.\scripts\get-winfsp-sdk.ps1             # or fetch just the SDK, no driver install
+.\build.ps1 -WinFsp .\.winfsp-sdk\DYNAMIC
 ```
 
-Run with `winfsp-x64.dll` on `PATH` (`C:\Program Files (x86)\WinFsp\bin`).
+`get-winfsp-sdk.ps1` downloads a pinned WinFsp release MSI, checks its SHA-256 and
+extracts it without installing anything. The result links the C runtime
+statically (no Visual C++ redistributable) and loads `winfsp-x64.dll` at run
+time from the installed WinFsp, printing "WinFsp is not installed" if it is
+missing. `winfsp-pipe-bridge.exe --version` works without WinFsp.
+
+## Releases
+
+Releases are built by GitHub Actions when a tag is pushed. The tag must match
+`BRIDGE_VERSION` in `src\winfsp-pipe-bridge.c`: `v0.1.0` for a release,
+`v0.1.0-rc.1` (any `-suffix`) for a pre-release.
+
+```powershell
+git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1
+```
+
+The workflow attaches a zip (exe, `LICENSE`, `README.md`) and `SHA256SUMS`.
+`.\scripts\release.ps1 -Tag v0.1.0-rc.1` builds the same files into `dist\`
+locally. The binary is not code-signed, and WinFsp itself is not bundled.
 
 ## Test
 

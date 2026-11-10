@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Get the WinFsp SDK
+        shell: pwsh
+        run: |
+          $sdk = ./scripts/get-winfsp-sdk.ps1
+          "WINFSP_SDK=$sdk" >> $env:GITHUB_ENV
+
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -WinFsp $env:WINFSP_SDK
+
+      # Needs no WinFsp driver: the DLL is delay-loaded and --version exits first.
+      - name: Check the binary starts
+        shell: pwsh
+        run: |
+          $out = ./winfsp-pipe-bridge.exe --version
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch '^winfsp-pipe-bridge \d') { throw "unexpected output: $out" }
+          $out

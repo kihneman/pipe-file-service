@@ -3,3 +3,6 @@
 *.pdb
 *.ilk
 *.log
+build/
+dist/
+.winfsp-sdk/
