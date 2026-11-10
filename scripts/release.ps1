@@ -41,7 +41,9 @@ Compress-Archive -Path "$stage\*" -DestinationPath $zip
 Remove-Item $stage -Recurse -Force
 
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-"$hash  $name.zip" | Set-Content (Join-Path $Out 'SHA256SUMS') -Encoding ascii
+# LF endings and no BOM, so `sha256sum -c SHA256SUMS` works on Linux, WSL and Git Bash
+# (Set-Content would write CRLF).
+[IO.File]::WriteAllText((Join-Path $Out 'SHA256SUMS'), "$hash  $name.zip`n", (New-Object Text.UTF8Encoding($false)))
 
 $notes = @"
 winfsp-pipe-bridge $releaseVersion (experimental, Windows x64)
