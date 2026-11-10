@@ -16,15 +16,28 @@ and contains no Keeper code: it only reads the pipe as an ordinary byte stream.
 ## How it works
 
 ```
-winfsp-pipe-bridge.exe \\.\pipe\<name> K:
+winfsp-pipe-bridge.exe \\.\pipe\<name> <mountpoint> [path on the volume]
 ```
 
-Mounts drive `K:` (or `*` to pick a free letter) containing one file,
-`property-file.env`. Opening it for reading connects to the pipe, reads until
-EOF and serves those bytes. If the pipe's server answers with its standard
-"Access denied" text the open fails with `STATUS_ACCESS_DENIED`. For every open
-the bridge logs the caller's PID and executable path, which WinFsp reports at
-open time.
+Mounts drive `K:` (or `*` to pick a free letter) containing one file. The file
+is at `\property-file.env` unless you give a path, which may have any number of
+directories before the file name:
+
+```
+winfsp-pipe-bridge.exe \\.\pipe\secrets K: \secrets\app\prod.env
+```
+
+serves `K:\secrets\app\prod.env`. The directories (`secrets`, `app`) exist only
+on the volume, are read-only, and contain nothing else. Separators may be `\`
+or `/`, the leading separator is optional, and names are matched
+case-insensitively. Empty components, `.` / `..`, a trailing separator,
+characters that are invalid in Windows names (`< > : " | ? *`), and paths deeper
+than 32 components are rejected with exit code 2.
+
+Opening the file for reading connects to the pipe, reads until EOF and serves
+those bytes. If the pipe's server answers with its standard "Access denied" text
+the open fails with `STATUS_ACCESS_DENIED`. For every open the bridge logs the
+caller's PID and executable path, which WinFsp reports at open time.
 
 ## Build
 
@@ -38,6 +51,17 @@ PowerShell:
 
 Run with `winfsp-x64.dll` on `PATH` (`C:\Program Files (x86)\WinFsp\bin`).
 
+## Test
+
+`tests\smoke.ps1` serves a pipe from the script itself, mounts it, and checks
+reads, nested and default paths, case-insensitive lookup, rejected paths, refused
+writes and unmount. It needs WinFsp, a built `winfsp-pipe-bridge.exe` and a free
+drive letter (default `K`):
+
+```powershell
+.\tests\smoke.ps1
+```
+
 ## Findings so far
 
 - Works with `Get-Content`, `cmd /c type`, Python and Node.
@@ -50,6 +74,8 @@ Run with `winfsp-x64.dll` on `PATH` (`C:\Program Files (x86)\WinFsp\bin`).
   read to end of file are fine; tools that trust the stat size may read nothing.
 - WinFsp refuses to dispatch creates unless the interface table has `Create`
   and `Overwrite`, even for a read-only volume (here they refuse writes).
+- `FileSystemName` holds 16 wide characters including the terminator; a longer
+  name makes the CRT fast-fail (`0xC0000409`) with no message.
 - The volume's security descriptor allows only the current user and SYSTEM, so
   other users cannot trigger reads through the bridge.
 
