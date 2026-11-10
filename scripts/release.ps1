@@ -52,11 +52,18 @@ Exposes a Windows named pipe as a read-only file on a WinFsp volume.
 
 **Requires WinFsp** (not included): https://github.com/winfsp/winfsp/releases
 
-**The binary is not code-signed**, so Windows SmartScreen may warn. Check the zip
-against ``SHA256SUMS``:
+**The binary is not Authenticode-signed**, so Windows SmartScreen may warn. Check the
+zip against ``SHA256SUMS``:
 
 ``````
 $hash  $name.zip
+``````
+
+The files carry a signed GitHub build attestation (built by this repository's release
+workflow from this tag). Verify it with the GitHub CLI:
+
+``````
+gh attestation verify $name.zip -R kihneman/winfsp-pipe-bridge
 ``````
 
 > WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos

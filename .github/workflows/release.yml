@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write      # sign the build attestation
+  attestations: write  # store it
 
 jobs:
   release:
@@ -26,6 +28,15 @@ jobs:
       - name: Build and package
         shell: pwsh
         run: ./scripts/release.ps1 -Tag $env:GITHUB_REF_NAME -WinFsp $env:WINFSP_SDK
+
+      # Signed statement that these files were built by this workflow from this
+      # tag; check with: gh attestation verify <zip> -R kihneman/winfsp-pipe-bridge
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/SHA256SUMS
 
       - name: Publish the release
         shell: pwsh

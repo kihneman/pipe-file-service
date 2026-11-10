@@ -68,7 +68,20 @@ git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1
 
 The workflow attaches a zip (exe, `LICENSE`, `README.md`) and `SHA256SUMS`.
 `.\scripts\release.ps1 -Tag v0.1.0-rc.1` builds the same files into `dist\`
-locally. The binary is not code-signed, and WinFsp itself is not bundled.
+locally. The binary is not Authenticode-signed (Windows SmartScreen may warn),
+and WinFsp itself is not bundled.
+
+### Verifying a release
+
+Each release's zip and `SHA256SUMS` carry a signed
+[GitHub build attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations),
+which proves they were built by this repository's release workflow from the
+tagged commit (releases before v0.1.2 have none):
+
+```
+gh attestation verify winfsp-pipe-bridge-<version>-windows-x64.zip -R kihneman/winfsp-pipe-bridge
+sha256sum -c SHA256SUMS
+```
 
 ## Test
 
