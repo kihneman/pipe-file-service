@@ -6,9 +6,9 @@ to open a file path can read a secret that a broker serves over a pipe. The
 content is fetched from the pipe each time the file is opened for reading and
 is never written to disk.
 
-It was written to try the idea with a pipe served by Keeper's property-file
-mounts on Windows. It is an independent personal project, not a Keeper product,
-and contains no Keeper code: it only reads the pipe as an ordinary byte stream.
+It is an independent personal project. It knows nothing about any particular
+server: it reads the pipe as an ordinary byte stream, or, with
+`--reader-info-suffix`, speaks the small protocol described below.
 
 > WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
 > https://github.com/winfsp/winfsp
@@ -38,6 +38,44 @@ Opening the file for reading connects to the pipe, reads until EOF and serves
 those bytes. If the pipe's server answers with its standard "Access denied" text
 the open fails with `STATUS_ACCESS_DENIED`. For every open the bridge logs the
 caller's PID and executable path, which WinFsp reports at open time.
+
+### Telling the server who opened the file (`--reader-info-suffix`)
+
+By default the pipe's server sees this program as the reader, because it is the
+pipe's client. A server that wants to know (and ask the user about) the program
+that actually opened the file can serve a second pipe, and you point the bridge
+at it with a suffix:
+
+```
+winfsp-pipe-bridge.exe \\.\pipe\secrets K: \secrets\app\prod.env --reader-info-suffix -reader
+```
+
+The bridge then opens `\\.\pipe\secrets-reader` (the pipe name plus the suffix),
+and on every open that requests data it sends the caller's PID and process
+creation time, taken in `Open` where WinFsp reports them. The server answers for
+that caller. This is a request, not a hint: if the second pipe is missing or the
+server refuses, the open fails. The bridge never falls back to the data pipe,
+because that would make the bridge the reader.
+
+Protocol, version 1. Every message is a frame: a 4-byte big-endian body length,
+one tag byte, then a JSON body.
+
+| Direction | Tag | Body |
+|---|---|---|
+| bridge to server | 72 | `{"protocol":1,"reader_pid":<u32>,"reader_start_time":<u64>}` (start time is the process creation FILETIME) |
+| server to bridge | 73 | `{"status":"ok"}` or `{"status":"denied"}` |
+
+After an `ok` response the server writes the content as raw bytes, unframed, and
+closes the pipe. After `denied`, or if the server closes the pipe without a
+response, the open fails with access denied. The server should verify the
+caller itself (the PID is still alive and was created at the stated time) and
+decide whether to trust the bridge; the bridge only reports what WinFsp told it.
+
+A server should only believe the caller information from a bridge it
+recognises, for example by looking up the pipe client's process and checking the
+SHA-256 of its executable (`Get-FileHash winfsp-pipe-bridge.exe`) against a list
+it trusts. The bridge is not signed, so such a list can only pin this exact
+file: a rebuilt or updated bridge has a new hash and has to be trusted again.
 
 ## Build
 
@@ -113,8 +151,7 @@ drive letter (default `K`):
 
 ## Not done
 
-Real caller identity forwarding to the pipe's server, Defender/indexer
-behaviour, multiple files, a service wrapper, an installer, tests.
+Defender/indexer behaviour, multiple files, a service wrapper, an installer.
 
 ## Licensing
 
