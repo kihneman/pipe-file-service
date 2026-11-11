@@ -15,7 +15,7 @@
 #include <stdarg.h>
 #include <sddl.h>
 
-#define BRIDGE_VERSION "0.1.2"   // scripts/release.ps1 reads this; release tags must match it
+#define BRIDGE_VERSION "0.2.0"   // scripts/release.ps1 reads this; release tags must match it
 #define DEFAULT_PATH L"\\property-file.env"
 #define DENIED_PREFIX "Access denied: you do not have permission"
 #define MAX_DEPTH 32
@@ -99,6 +99,110 @@ static void caller(char *out, size_t n)
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (h) { DWORD l = MAX_PATH; QueryFullProcessImageNameW(h, 0, path, &l); CloseHandle(h); }
     snprintf(out, n, "pid=%u image=%ls", pid, path);
+}
+
+// Reader info (--reader-info-suffix <suffix>). With the option, the content is
+// not read from the data pipe directly: the bridge opens a second pipe named
+// <data pipe><suffix>, sends the PID and creation time of the program that
+// opened the file, and the server answers for that program (it can ask the user
+// about it, refuse it, or serve it). The protocol is described in the README.
+// The option is a request, not a hint: if the second pipe is missing or the
+// server refuses, the open fails. It never falls back to the data pipe, which
+// would make this program the reader.
+#define FORWARD_PROTOCOL 1
+#define TAG_READ_REQUEST 72
+#define TAG_READ_RESPONSE 73
+
+static WCHAR g_reader_info_pipe[512];   // empty unless --reader-info-suffix was given
+
+static BOOL read_exact(HANDLE h, BYTE *p, DWORD n)
+{
+    while (n) {
+        DWORD got = 0;
+        if (!ReadFile(h, p, n, &got, NULL) || got == 0) return FALSE;
+        p += got; n -= got;
+    }
+    return TRUE;
+}
+
+static void read_to_eof(HANDLE h, BYTE **pdata, SIZE_T *plen, SIZE_T *pcap)
+{
+    SIZE_T cap = 4096, len = 0;
+    BYTE *buf = (BYTE *)malloc(cap);
+    for (;;) {
+        if (len == cap) { cap *= 2; buf = (BYTE *)realloc(buf, cap); }
+        DWORD got = 0;
+        if (!ReadFile(h, buf + len, (DWORD)(cap - len), &got, NULL) || got == 0) break;
+        len += got;
+    }
+    *pdata = buf; *plen = len; *pcap = cap;
+}
+
+// Asks the reader-info pipe for the content on behalf of process `pid`.
+static NTSTATUS fetch_forwarded(UINT32 pid, BYTE **pdata, SIZE_T *plen)
+{
+    // Holding the process open keeps its PID from being reused while we ask.
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    FILETIME created, exited, kernel, user;
+    if (pid == 0 || !proc || !GetProcessTimes(proc, &created, &exited, &kernel, &user)) {
+        logf_("  cannot identify the calling process (pid %u); refusing", pid);
+        if (proc) CloseHandle(proc);
+        return STATUS_ACCESS_DENIED;
+    }
+    UINT64 start = ((UINT64)created.dwHighDateTime << 32) | created.dwLowDateTime;
+
+    DWORD first = GetTickCount(), deadline = first + 10000;
+    HANDLE h;
+    for (;;) {
+        h = CreateFileW(g_reader_info_pipe, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) break;
+        DWORD e = GetLastError();
+        // Between instances the pipe can be briefly absent; a pipe that stays absent is an error.
+        if (e == ERROR_FILE_NOT_FOUND && GetTickCount() - first >= 2000) {
+            logf_("  the reader-info pipe is not served: %ls", g_reader_info_pipe);
+            CloseHandle(proc);
+            return STATUS_IO_DEVICE_ERROR;
+        }
+        if ((e == ERROR_PIPE_BUSY || e == ERROR_FILE_NOT_FOUND) && GetTickCount() < deadline) { Sleep(50); continue; }
+        logf_("  reader-info pipe open failed: %lu", e);
+        CloseHandle(proc);
+        return STATUS_IO_DEVICE_ERROR;
+    }
+
+    char body[128];
+    int blen = snprintf(body, sizeof body, "{\"protocol\":%d,\"reader_pid\":%u,\"reader_start_time\":%llu}",
+        FORWARD_PROTOCOL, pid, (unsigned long long)start);
+    BYTE frame[5 + sizeof body];
+    frame[0] = 0; frame[1] = 0; frame[2] = (BYTE)(blen >> 8); frame[3] = (BYTE)blen; frame[4] = TAG_READ_REQUEST;
+    memcpy(frame + 5, body, blen);
+    DWORD wrote = 0;
+    NTSTATUS result = STATUS_ACCESS_DENIED;
+    if (!WriteFile(h, frame, 5 + blen, &wrote, NULL)) {
+        logf_("  reader-info pipe write failed: %lu", GetLastError());
+        result = STATUS_IO_DEVICE_ERROR;
+    } else {
+        BYTE hdr[5];
+        if (!read_exact(h, hdr, 5)) {
+            logf_("  the server closed the reader-info pipe without answering: it probably does not trust this "
+                  "program (check its log; it may require this program's SHA-256 to be on a trusted list)");
+        } else {
+            DWORD rlen = ((DWORD)hdr[0] << 24) | ((DWORD)hdr[1] << 16) | ((DWORD)hdr[2] << 8) | hdr[3];
+            char rbody[256] = {0};
+            if (hdr[4] != TAG_READ_RESPONSE || rlen >= sizeof rbody || !read_exact(h, (BYTE *)rbody, rlen)) {
+                logf_("  unexpected answer on the reader-info pipe");
+                result = STATUS_IO_DEVICE_ERROR;
+            } else if (strstr(rbody, "\"ok\"") == NULL) {
+                logf_("  the server denied the read");
+            } else {
+                SIZE_T cap;
+                read_to_eof(h, pdata, plen, &cap);
+                result = STATUS_SUCCESS;
+            }
+        }
+    }
+    CloseHandle(h);
+    CloseHandle(proc);
+    return result;
 }
 
 static NTSTATUS fetch(BYTE **pdata, SIZE_T *plen)
@@ -217,7 +321,12 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 opts, UINT32 access
         char who[600]; caller(who, sizeof who);
         logf_("OPEN  %ls access=0x%08x %s", name, access, who);
         // Attribute-only opens (stat, directory listings, AV probes) must not read the secret.
-        NTSTATUS st = (access & FILE_READ_DATA) ? fetch(&c->data, &c->len) : STATUS_SUCCESS;
+        NTSTATUS st = STATUS_SUCCESS;
+        if (access & FILE_READ_DATA) {
+            st = g_reader_info_pipe[0]
+                ? fetch_forwarded(FspFileSystemOperationProcessIdF(), &c->data, &c->len)
+                : fetch(&c->data, &c->len);
+        }
         if (!NT_SUCCESS(st)) { free(c); logf_("  -> 0x%08x", (unsigned)st); return st; }
         logf_("  -> %zu bytes", c->len);
     }
@@ -306,9 +415,20 @@ int wmain(int argc, wchar_t **argv)
         printf("winfsp-pipe-bridge %s\n", BRIDGE_VERSION);
         return 0;
     }
-    if (argc < 3 || argc > 4) {
+    const wchar_t *suffix = NULL;
+    int bad_option = 0;
+    for (int i = 1; i < argc; i++) {
+        if (0 != wcscmp(argv[i], L"--reader-info-suffix")) continue;
+        if (suffix || i + 1 >= argc || argv[i + 1][0] == 0) { bad_option = 1; break; }
+        suffix = argv[i + 1];
+        memmove(&argv[i], &argv[i + 2], (argc - i - 2) * sizeof(*argv));
+        argc -= 2; i--;
+    }
+    if (bad_option || argc < 3 || argc > 4) {
         fwprintf(stderr,
-            L"usage: winfsp-pipe-bridge <\\\\.\\pipe\\name> <mountpoint: K: or *> [path on the volume]\n"
+            L"usage: winfsp-pipe-bridge <\\\\.\\pipe\\name> <mountpoint: K: or *> [path on the volume] [--reader-info-suffix <suffix>]\n"
+            L"  --reader-info-suffix: do not read the pipe directly; open <pipe name><suffix>, tell the server which\n"
+            L"  program opened the file (PID and start time) and read the content it serves for that program\n"
             L"  path defaults to %ls; directories above the file are created virtually,\n"
             L"  e.g. \\secrets\\app\\prod.env\n", DEFAULT_PATH);
         return 2;
@@ -324,6 +444,10 @@ int wmain(int argc, wchar_t **argv)
         return 1;
     }
     wcsncpy_s(g_pipe, 512, argv[1], _TRUNCATE);
+    if (suffix) {
+        if (wcslen(g_pipe) + wcslen(suffix) >= 512) { fprintf(stderr, "pipe name plus suffix is too long\n"); return 2; }
+        swprintf_s(g_reader_info_pipe, 512, L"%ls%ls", g_pipe, suffix);
+    }
     FILETIME ft; GetSystemTimeAsFileTime(&ft);
     g_now = ((UINT64)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
     g_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -347,6 +471,7 @@ int wmain(int argc, wchar_t **argv)
     st = FspFileSystemStartDispatcher(fs, 0);
     if (!NT_SUCCESS(st)) { fprintf(stderr, "StartDispatcher failed: 0x%08x\n", (unsigned)st); FspFileSystemDelete(fs); return 1; }
     logf_("serving %ls on %ls from %ls (Ctrl-C to stop)", g_prefix[g_ncomp - 1], argv[2], g_pipe);
+    if (g_reader_info_pipe[0]) logf_("reader info: asking %ls who opened the file", g_reader_info_pipe);
     WaitForSingleObject(g_stop, INFINITE);
     FspFileSystemStopDispatcher(fs);
     FspFileSystemDelete(fs);
