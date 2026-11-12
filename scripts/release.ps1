@@ -29,13 +29,16 @@ if ($Tag) {
 $exe = Join-Path $root 'winfsp-pipe-bridge.exe'
 $reported = (& $exe --version)
 if ($reported -ne "winfsp-pipe-bridge $version") { throw "The built binary reports '$reported', expected 'winfsp-pipe-bridge $version'." }
+$svcExe = Join-Path $root 'FspPipeFileService.exe'
+$reported = (& $svcExe --version)
+if ($reported -ne "FspPipeFileService $version") { throw "The built service reports '$reported', expected 'FspPipeFileService $version'." }
 
 if (Test-Path $Out) { Remove-Item $Out -Recurse -Force }
 New-Item -ItemType Directory $Out | Out-Null
 $name = "winfsp-pipe-bridge-$releaseVersion-windows-x64"
 $stage = Join-Path $Out $name
 New-Item -ItemType Directory $stage | Out-Null
-Copy-Item $exe, (Join-Path $root 'LICENSE'), (Join-Path $root 'README.md') $stage
+Copy-Item $exe, $svcExe, (Join-Path $root 'LICENSE'), (Join-Path $root 'README.md') $stage
 $zip = Join-Path $Out "$name.zip"
 Compress-Archive -Path "$stage\*" -DestinationPath $zip
 Remove-Item $stage -Recurse -Force
@@ -49,6 +52,9 @@ $notes = @"
 winfsp-pipe-bridge $releaseVersion (experimental, Windows x64)
 
 Exposes a Windows named pipe as a read-only file on a WinFsp volume.
+``winfsp-pipe-bridge.exe`` does it for one pipe in one process; ``FspPipeFileService.exe`` is a
+Windows service that does it for any local user's app and can link placeholder files to the
+pipes (see the README).
 
 **Requires WinFsp** (not included): https://github.com/winfsp/winfsp/releases
 

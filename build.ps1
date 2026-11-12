@@ -28,3 +28,7 @@ New-Item -ItemType Directory -Force build | Out-Null
 cl /nologo /W3 /std:c11 /MT /Fo:build\ /Fe:winfsp-pipe-bridge.exe src\winfsp-pipe-bridge.c `
     /I"$WinFsp\inc" /link "$WinFsp\lib\winfsp-x64.lib" advapi32.lib delayimp.lib /DELAYLOAD:winfsp-x64.dll
 if ($LASTEXITCODE -ne 0) { throw "cl.exe failed with exit code $LASTEXITCODE" }
+
+cl /nologo /W3 /std:c11 /MT /Fo:build\ /Fe:FspPipeFileService.exe src\FspPipeFileService.c `
+    /I"$WinFsp\inc" /link "$WinFsp\lib\winfsp-x64.lib" advapi32.lib delayimp.lib /DELAYLOAD:winfsp-x64.dll
+if ($LASTEXITCODE -ne 0) { throw "cl.exe failed with exit code $LASTEXITCODE" }

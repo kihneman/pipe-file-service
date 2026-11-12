@@ -15,7 +15,7 @@
 #include <stdarg.h>
 #include <sddl.h>
 
-#define BRIDGE_VERSION "0.2.0"   // scripts/release.ps1 reads this; release tags must match it
+#define BRIDGE_VERSION "0.3.0"   // scripts/release.ps1 reads this; release tags must match it
 #define DEFAULT_PATH L"\\property-file.env"
 #define DENIED_PREFIX "Access denied: you do not have permission"
 #define MAX_DEPTH 32
