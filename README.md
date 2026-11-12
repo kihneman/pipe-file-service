@@ -77,6 +77,121 @@ SHA-256 of its executable (`Get-FileHash winfsp-pipe-bridge.exe`) against a list
 it trusts. The bridge is not signed, so such a list can only pin this exact
 file: a rebuilt or updated bridge has a new hash and has to be trusted again.
 
+## FspPipeFileService
+
+A Windows service for apps that cannot start a program of their own, or that need a
+file *link*. It is the privileged counterpart of `winfsp-pipe-bridge.exe`: one
+long-running service, on one WinFsp volume, that any local user's app can ask to
+
+1. show a named pipe as a read-only file (the **data server** is whatever serves the pipe), and
+2. turn an empty placeholder file the app made into a symlink to that file. Only a
+   privileged process may create file symlinks without Developer Mode.
+
+```
+FspPipeFileService.exe install [--mount <folder that does not exist, or a drive letter>]   (elevated)
+FspPipeFileService.exe uninstall                                                           (elevated)
+FspPipeFileService.exe run [--mount <...>]    run in this console (elevated), for development
+```
+
+The default mount is `C:\ProgramData\FspPipeFileService\mount` (a WinFsp mount
+folder must not exist; the service creates the parent and removes an empty
+leftover). The service is `FspPipeFileService`, display name "WinFsp Pipe File
+Service", runs as LocalSystem with a minimal privilege list
+(`SeCreateSymbolicLinkPrivilege`, `SeImpersonatePrivilege`, `SeChangeNotifyPrivilege`)
+and is started on demand. It writes `C:\ProgramData\FspPipeFileService\service.log`.
+
+### The volume
+
+Flat and read-only: each registration is one file in the volume root, named
+
+```
+<pipe name without \\.\pipe\>-<requested file name>
+```
+
+Characters that are invalid in file names are replaced by `_` in the pipe part. The
+whole requested name survives (`.env`, `.tar.gz`), but **the name on the volume is
+not the exact requested name**, so a tool that follows the link and matches on the
+exact file name will not match. A registration is refused when:
+
+- the pipe name has a sub-path (a backslash after `\\.\pipe\`);
+- the requested name is not one path component, contains characters invalid in
+  Windows names, ends in a dot or a space, is `.`/`..`, or is a reserved device name;
+- the combined name exceeds 255 characters;
+- the pipe, **or the final combined name**, is already registered (`foo-bar` + `baz`
+  and `foo` + `bar-baz` produce the same name).
+
+Each file carries a security descriptor that lets only the user who registered it
+(and SYSTEM) open it. The names of all registrations are visible to every
+authenticated user in the root listing; the content is not.
+
+Reading: on an open that requests data the service opens the data pipe **as the
+registering user** (it keeps an impersonation token from the registering
+connection, because such a pipe is normally owner-only) and serves what it reads.
+With a reader-info suffix it speaks the protocol above on `<pipe><suffix>` and
+passes the real caller's PID and start time itself. Attribute-only opens never fetch.
+
+### Control pipe
+
+`\\.\pipe\FspPipeFileService`: message mode, local clients only, writable by
+interactive users. One JSON object per message, flat (no nesting). Identity is
+always taken from the connection (`ImpersonateNamedPipeClient`), never from a field.
+A connection sees and changes only its own registrations. **When the connection
+closes, or the service stops, everything it registered is removed, including links.**
+
+Requests (all may carry a numeric `id`, which is echoed in the reply):
+
+| `type` | fields |
+| --- | --- |
+| `register` | `pipe` (full pipe name), `file_name`, optional `reader_info_suffix`, optional `link_path` |
+| `unregister` | `pipe` |
+
+Replies have `"type":"reply"` and `"status":"ok"` or `"error"`. On success
+`register` returns `path` (the file inside the mount) and `linked`. Errors carry
+`code` (`bad_request`, `bad_name`, `pipe_unreachable`, `name_in_use`, `link_refused`,
+`not_found`) and a `message`. The service pushes events, `"type":"event"`, with
+`event` of `opened`, `denied` or `error`, plus `file` and `reader_pid`.
+
+Before accepting a registration the service opens the pipe it would read **as the
+caller** and refuses if that fails, so a caller cannot register a pipe it cannot
+reach, and a refusal reveals nothing about other users' pipes. This opening is a
+real, brief connection to the data server (or to the reader-info pipe when a suffix
+is given); a server should expect, and quickly drop, a client that connects and
+sends nothing.
+
+### Links (the placeholder-file protocol)
+
+The app creates an **empty file** at the destination as itself and passes it as
+`link_path` (an absolute path such as `C:\dir\file`). The service never acts on a
+path later:
+
+1. As the caller, it opens the placeholder without following links, with only
+   attribute access. A file the caller cannot write fails here.
+2. On that handle it checks: regular file (not a directory or a link), size 0, link
+   count 1, and the owner is the caller's user (or Administrators when the caller's
+   token is elevated). Anything else is refused with the reason, and nothing is touched.
+3. It reopens the same file **by file ID** as the service, confirms the ID, and sets
+   the symlink reparse data there. (Windows checks the symlink privilege against the
+   identity that opened the handle, so the handle opened as the caller cannot be used;
+   see `docs/placeholder-link-findings.md`.)
+4. When the registration ends, it removes the link if it is still a symlink to the
+   target it set, and leaves the empty file.
+
+### Install
+
+The service needs WinFsp installed. The WinFsp installer also installs and starts
+`WinFsp.Launcher`, a separate service this project does not use. The service does not
+use a restricted service SID: that makes the token write-restricted and it then
+cannot create its folder or reopen a user's placeholder.
+
+Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated;
+`tests\service-smoke.ps1` runs as an ordinary user, the realistic caller):
+
+```powershell
+.\tests\service-up.ps1        # elevated: install + start
+.\tests\service-smoke.ps1     # unelevated
+.\tests\service-down.ps1      # elevated: stop + uninstall + check nothing is left
+```
+
 ## Build
 
 Requires the Visual Studio C++ x64 build tools (`build.ps1` finds them itself)
@@ -92,7 +207,8 @@ and the WinFsp SDK (headers and import library):
 extracts it without installing anything. The result links the C runtime
 statically (no Visual C++ redistributable) and loads `winfsp-x64.dll` at run
 time from the installed WinFsp, printing "WinFsp is not installed" if it is
-missing. `winfsp-pipe-bridge.exe --version` works without WinFsp.
+missing. `winfsp-pipe-bridge.exe --version` works without WinFsp. The same script builds
+`FspPipeFileService.exe`.
 
 ## Releases
 
@@ -104,7 +220,7 @@ Releases are built by GitHub Actions when a tag is pushed. The tag must match
 git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1
 ```
 
-The workflow attaches a zip (exe, `LICENSE`, `README.md`) and `SHA256SUMS`.
+The workflow attaches a zip (both exes, `LICENSE`, `README.md`) and `SHA256SUMS`.
 `.\scripts\release.ps1 -Tag v0.1.0-rc.1` builds the same files into `dist\`
 locally. The binary is not Authenticode-signed (Windows SmartScreen may warn),
 and WinFsp itself is not bundled.
@@ -151,7 +267,7 @@ drive letter (default `K`):
 
 ## Not done
 
-Defender/indexer behaviour, multiple files, a service wrapper, an installer.
+Defender/indexer behaviour, an installer (the service is not packaged, signed or chained with WinFsp), and a share of the volume across users beyond what is described above.
 
 ## Licensing
 
