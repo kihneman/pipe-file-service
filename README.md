@@ -88,9 +88,9 @@ long-running service, on one WinFsp volume, that any local user's app can ask to
    privileged process may create file symlinks without Developer Mode.
 
 ```
-FspPipeFileService.exe install [--mount <folder that does not exist, or a drive letter>]   (elevated)
-FspPipeFileService.exe uninstall                                                           (elevated)
-FspPipeFileService.exe run [--mount <...>]    run in this console (elevated), for development
+FspPipeFileService.exe install [--mount <folder that does not exist, or a drive letter>] [--auto-start]   (elevated)
+FspPipeFileService.exe uninstall                                                                          (elevated)
+FspPipeFileService.exe run [--mount <...>] [--winfsp-dir <folder>]    run in this console (elevated), for development
 ```
 
 The default mount is `C:\ProgramData\FspPipeFileService\mount` (a WinFsp mount
@@ -98,7 +98,8 @@ folder must not exist; the service creates the parent and removes an empty
 leftover). The service is `FspPipeFileService`, display name "WinFsp Pipe File
 Service", runs as LocalSystem with a minimal privilege list
 (`SeCreateSymbolicLinkPrivilege`, `SeImpersonatePrivilege`, `SeChangeNotifyPrivilege`)
-and is started on demand. It writes `C:\ProgramData\FspPipeFileService\service.log`.
+and is started on demand, or at every boot with `install --auto-start`. It writes
+`C:\ProgramData\FspPipeFileService\service.log`.
 
 ### The volume
 
@@ -148,7 +149,7 @@ Requests (all may carry a numeric `id`, which is echoed in the reply):
 Replies have `"type":"reply"` and `"status":"ok"` or `"error"`. On success
 `register` returns `path` (the file inside the mount) and `linked`. Errors carry
 `code` (`bad_request`, `bad_name`, `pipe_unreachable`, `name_in_use`, `link_refused`,
-`not_found`) and a `message`. The service pushes events, `"type":"event"`, with
+`not_found`, `driver_not_installed`) and a `message`. The service pushes events, `"type":"event"`, with
 `event` of `opened`, `denied` or `error`, plus `file` and `reader_pid`.
 
 Before accepting a registration the service opens the pipe it would read **as the
@@ -178,7 +179,64 @@ path later:
 
 ### Install
 
-The service needs WinFsp installed. The WinFsp installer also installs and starts
+The service needs WinFsp installed, but it is safe to install it on a machine
+that does not have WinFsp (for example from an app installer that fetches WinFsp
+later, only if the user agrees):
+
+- **At start, WinFsp missing:** the service logs one line to `service.log`, opens
+  **no control pipe**, and stops with exit code 0. The Service Control Manager
+  logs no failure and runs no recovery action. The start type is left alone, so
+  with `install --auto-start` it tries again at every boot. Nothing polls and
+  nothing listens while WinFsp is missing: **the control pipe does not exist until
+  WinFsp is installed and the service is started.**
+- **After installing WinFsp:** start the service again with an elevated
+  `sc start FspPipeFileService` (or reboot). There is no wake-up message.
+- **WinFsp removed while the service runs:** `register` answers
+  `driver_not_installed` and registers nothing. Registrations that already exist
+  are left alone; they stop working by themselves (reads fail) and are cleaned up
+  when their connection closes or the service stops.
+- "WinFsp is installed" means: the registry `InstallDir` under
+  `HKLM\SOFTWARE\WOW6432Node\WinFsp` has `bin\winfsp-x64.dll`, and a `WinFsp` file system
+  driver service is registered (WinFsp 2.x names it `WinFsp+<timestamp>`). The check
+  loads no WinFsp code.
+- For tests, `run --winfsp-dir <folder>` makes the check look for
+  `<folder>\bin\winfsp-x64.dll` instead. It exists only in `run` mode.
+
+### Installing WinFsp silently (for an installer or app)
+
+Use the unmodified WinFsp installer from the WinFsp project (verify its SHA-256
+and its Authenticode signature, signer `NAVIMATICS LLC`, before running it). From
+an elevated process:
+
+```
+msiexec /i winfsp-2.1.25156.msi /qn /norestart ADDLOCAL=F.Main,F.User /l*v C:\path\winfsp-install.log
+```
+
+`F.User` is the driver, `winfsp-x64.dll`, the `WinFsp.Launcher` service (it
+cannot be left out; this project does not use it) and the command-line tools. The
+other features (`F.Developer`, `F.KernelDeveloper`, `F.Cygfuse`) are headers,
+samples and Cygwin support and are off by default.
+
+Exit codes: `0` success, `3010` success and a restart is requested, `1618`
+another installation is running (wait and retry), `1603` fatal error. From the
+installer's own tables: a newer WinFsp already installed makes it refuse with
+`1603` ("A newer version of WinFsp is already installed"; read the log to tell it
+apart), and an older one is upgraded in place.
+
+Afterwards, check: `HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir` exists with
+`bin\winfsp-x64.dll` in it, a `WinFsp+...` file system driver service is registered (`sc query type= driver state= all`), and the
+`WinFsp.Launcher` service is running. Then `sc start FspPipeFileService`.
+
+Uninstall (the product code changes with every WinFsp version; find it from the
+upgrade code `{5466A3D8-3AA1-4240-B6A0-3A051940A3EC}`):
+
+```
+msiexec /x {product-code} /qn /norestart /l*v C:\path\winfsp-uninstall.log
+```
+
+`tests\install-chain.ps1` runs this whole sequence on a clean VM.
+
+The WinFsp installer also installs and starts
 `WinFsp.Launcher`, a separate service this project does not use. The service does not
 use a restricted service SID: that makes the token write-restricted and it then
 cannot create its folder or reopen a user's placeholder.
@@ -191,6 +249,11 @@ Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated;
 .\tests\service-smoke.ps1     # unelevated
 .\tests\service-down.ps1      # elevated: stop + uninstall + check nothing is left
 ```
+
+`tests\driver-missing.ps1` checks the WinFsp-missing behaviour with `--winfsp-dir`
+(the first part runs unelevated; the rest needs an elevated shell and no running
+service). `tests\install-chain.ps1` is for a clean VM (elevated): service installed
+before WinFsp, WinFsp installed silently, WinFsp removed again.
 
 ## Build
 

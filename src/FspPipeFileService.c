@@ -16,7 +16,7 @@
 #include <sddl.h>
 #include <aclapi.h>
 
-#define SERVICE_VERSION "0.3.0"   // keep equal to BRIDGE_VERSION in winfsp-pipe-bridge.c
+#define SERVICE_VERSION "0.4.0"   // keep equal to BRIDGE_VERSION in winfsp-pipe-bridge.c
 #define SVC_NAME L"FspPipeFileService"
 #define SVC_DISPLAY L"WinFsp Pipe File Service"
 #define CONTROL_PIPE L"\\\\.\\pipe\\FspPipeFileService"
@@ -737,6 +737,8 @@ static BOOL probe_pipe(Conn *c, const WCHAR *name, DWORD access, DWORD *err)
     return *err == ERROR_PIPE_BUSY;   // exists, all instances busy
 }
 
+static BOOL winfsp_installed(void);
+
 static void do_register(Conn *c, const Json *j, const WCHAR *id)
 {
     const WCHAR *pipe = jget(j, L"pipe"), *file = jget(j, L"file_name");
@@ -745,6 +747,8 @@ static void do_register(Conn *c, const Json *j, const WCHAR *id)
     WCHAR name[MAX_NAME + 1];
     const char *why = build_volume_name(pipe, file, name);
     if (why) { send_reply(c, id, "error", "bad_name", why, NULL, -1); return; }
+    // WinFsp can be removed while the service runs: existing registrations are left alone (they fail by themselves).
+    if (!winfsp_installed()) { send_reply(c, id, "error", "driver_not_installed", "WinFsp is not installed; install it and try again", NULL, -1); return; }
     if (suffix && (wcslen(suffix) == 0 || wcslen(suffix) > MAX_SUFFIX || wcschr(suffix, L'\\') || wcschr(suffix, L'/'))) {
         send_reply(c, id, "error", "bad_request", "reader_info_suffix must be 1 to 64 characters without a path separator", NULL, -1); return;
     }
@@ -933,6 +937,53 @@ static DWORD WINAPI accept_thread(LPVOID arg)
     return 0;
 }
 
+// ---------------------------------------------------------------- is WinFsp installed?
+
+static WCHAR g_winfsp_dir[MAX_PATHW];   // development override (run mode only); empty = use the registry and the driver service
+
+// WinFsp 2.x registers its file system driver under a unique name, "WinFsp+<timestamp>", so look for
+// a file system driver service whose name starts with "WinFsp".
+static BOOL winfsp_driver_registered(void)
+{
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_ENUMERATE_SERVICE);
+    if (!scm) return TRUE;   // cannot ask; the DLL is there, so let the real load decide
+    BOOL found = FALSE;
+    DWORD cap = 64 * 1024, need = 0, count = 0, resume = 0;
+    BYTE *buf = (BYTE *)malloc(cap);
+    for (;;) {
+        BOOL ok = EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_FILE_SYSTEM_DRIVER, SERVICE_STATE_ALL,
+            buf, cap, &need, &count, &resume, NULL);
+        DWORD err = ok ? 0 : GetLastError();
+        if (!ok && err != ERROR_MORE_DATA) { found = TRUE; break; }   // cannot tell: let the real load decide
+        ENUM_SERVICE_STATUS_PROCESSW *svc = (ENUM_SERVICE_STATUS_PROCESSW *)buf;
+        for (DWORD i = 0; i < count && !found; i++)
+            found = 0 == _wcsnicmp(svc[i].lpServiceName, L"" FSP_FSCTL_DRIVER_NAME, wcslen(L"" FSP_FSCTL_DRIVER_NAME))
+                && (svc[i].lpServiceName[wcslen(L"" FSP_FSCTL_DRIVER_NAME)] == 0 || svc[i].lpServiceName[wcslen(L"" FSP_FSCTL_DRIVER_NAME)] == L'+');
+        if (ok || found) break;
+    }
+    free(buf);
+    CloseServiceHandle(scm);
+    return found;
+}
+
+// True when WinFsp is installed: the DLL FspLoad() would load is where the registry says, and the
+// WinFsp driver service exists. Touches no WinFsp code, so it is safe before the delay-loaded DLL is.
+static BOOL winfsp_installed(void)
+{
+    WCHAR path[MAX_PATHW];
+    if (g_winfsp_dir[0]) {
+        swprintf_s(path, MAX_PATHW, L"%ls\\bin\\winfsp-x64.dll", g_winfsp_dir);
+        return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+    }
+    WCHAR dir[MAX_PATH];
+    DWORD sz = sizeof dir;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"" FSP_FSCTL_PRODUCT_FULL_REGKEY, L"InstallDir", RRF_RT_REG_SZ, NULL, dir, &sz) != ERROR_SUCCESS)
+        return FALSE;
+    swprintf_s(path, MAX_PATHW, L"%ls\\bin\\winfsp-x64.dll", dir);
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return FALSE;
+    return winfsp_driver_registered();
+}
+
 // ---------------------------------------------------------------- serving
 
 static BOOL enable_privilege(const WCHAR *name)
@@ -950,7 +1001,12 @@ static BOOL enable_privilege(const WCHAR *name)
 
 static int serve(const WCHAR *mount)
 {
-    if (!NT_SUCCESS(FspLoad(0))) { logf_("WinFsp is not installed. Get it from https://winfsp.dev/"); return 11; }
+    if (!winfsp_installed()) {
+        // Normal exit, no control pipe, nothing polling: start the service again once WinFsp is installed.
+        logf_("WinFsp is not installed (get it from https://winfsp.dev/); exiting without opening the control pipe. Start the service again after installing it.");
+        return 0;
+    }
+    if (!NT_SUCCESS(FspLoad(0))) { logf_("WinFsp is installed but cannot be loaded. Get it from https://winfsp.dev/"); return 11; }
     InitializeCriticalSection(&g_lock);
     wcscpy_s(g_mount, MAX_PATHW, mount);
     size_t ml = wcslen(g_mount);
@@ -1058,7 +1114,7 @@ static void WINAPI svc_main(DWORD argc, LPWSTR *argv)
 
 static BOOL WINAPI on_ctrl(DWORD t) { (void)t; SetEvent(g_stop); return TRUE; }
 
-static int install(const WCHAR *mount)
+static int install(const WCHAR *mount, BOOL auto_start)
 {
     WCHAR exe[MAX_PATH], cmd[MAX_PATH + 16];
     GetModuleFileNameW(NULL, exe, MAX_PATH);
@@ -1066,7 +1122,7 @@ static int install(const WCHAR *mount)
     SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
     if (!scm) { fprintf(stderr, "cannot open the service manager (run elevated): %lu\n", GetLastError()); return 1; }
     SC_HANDLE s = CreateServiceW(scm, SVC_NAME, SVC_DISPLAY, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
-        SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, cmd, NULL, NULL, NULL, NULL, NULL);
+        auto_start ? SERVICE_AUTO_START : SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, cmd, NULL, NULL, NULL, NULL, NULL);
     if (!s) { fprintf(stderr, "CreateService failed: %lu\n", GetLastError()); CloseServiceHandle(scm); return 1; }
     SERVICE_DESCRIPTIONW d = { L"Shows named pipes as read-only files on a WinFsp volume and links placeholder files to them." };
     ChangeServiceConfig2W(s, SERVICE_CONFIG_DESCRIPTION, &d);
@@ -1111,9 +1167,10 @@ static int usage(void)
 {
     fwprintf(stderr,
         L"usage: FspPipeFileService <command>\n"
-        L"  install [--mount <folder that does not exist, or a drive letter>]   (elevated)\n"
+        L"  install [--mount <folder that does not exist, or a drive letter>] [--auto-start]   (elevated)\n"
         L"  uninstall                                                           (elevated)\n"
-        L"  run [--mount <...>]    run in this console (elevated), for development\n"
+        L"  run [--mount <...>] [--winfsp-dir <folder>]   run in this console (elevated), for development;\n"
+        L"      --winfsp-dir makes the WinFsp check look for <folder>\\bin\\winfsp-x64.dll instead of the real install\n"
         L"  --version\n"
         L"default mount: %ls\n", DEFAULT_MOUNT);
     return 2;
@@ -1127,13 +1184,18 @@ int wmain(int argc, wchar_t **argv)
     }
     if (argc < 2) return usage();
     const WCHAR *mount = DEFAULT_MOUNT;
-    if (argc >= 3) {
-        if (argc != 4 || 0 != wcscmp(argv[2], L"--mount") || argv[3][0] == 0) return usage();
-        mount = argv[3];
+    BOOL auto_start = FALSE;
+    BOOL is_install = 0 == wcscmp(argv[1], L"install"), is_run = 0 == wcscmp(argv[1], L"run");
+    if (0 == wcscmp(argv[1], L"uninstall") || 0 == wcscmp(argv[1], L"service")) { if (argc != 2) return usage(); }
+    else for (int i = 2; i < argc; i++) {
+        if (0 == wcscmp(argv[i], L"--mount") && i + 1 < argc && argv[i + 1][0]) mount = argv[++i];
+        else if (is_install && 0 == wcscmp(argv[i], L"--auto-start")) auto_start = TRUE;
+        else if (is_run && 0 == wcscmp(argv[i], L"--winfsp-dir") && i + 1 < argc && argv[i + 1][0]) wcscpy_s(g_winfsp_dir, MAX_PATHW, argv[++i]);   // never read in service mode
+        else return usage();
     }
-    if (0 == wcscmp(argv[1], L"install")) return install(mount);
+    if (is_install) return install(mount, auto_start);
     if (0 == wcscmp(argv[1], L"uninstall") && argc == 2) return uninstall();
-    if (0 == wcscmp(argv[1], L"run")) {
+    if (is_run) {
         g_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
         SetConsoleCtrlHandler(on_ctrl, TRUE);
         return serve(mount);
