@@ -76,3 +76,4 @@ finally {
 }
 if ($script:failures) { "$script:failures check(s) failed"; exit 1 }
 'all checks passed'
+exit 0   # explicit: otherwise a leftover $LASTEXITCODE from a native command becomes the exit code

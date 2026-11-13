@@ -275,6 +275,8 @@ Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated;
 ```
 
 `tests\limits.ps1` (unelevated, service running) checks the control-pipe limits.
+`tests\exit-codes.ps1` checks that the test scripts end with an explicit `exit`, so a passing run
+reports exit code 0 even when started with `&` or from a CI step.
 `tests\driver-missing.ps1` checks the WinFsp-missing behaviour with `--winfsp-dir`
 (the first part runs unelevated; the rest needs an elevated shell and no running
 service). `tests\install-chain.ps1` is for a clean VM (elevated): service installed
