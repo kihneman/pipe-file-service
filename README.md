@@ -3,7 +3,7 @@
 **Experimental spike.** Exposes a Windows named pipe as a read-only file on a
 [WinFsp](https://github.com/winfsp/winfsp) volume, so tools that only know how
 to open a file path can read a secret that a broker serves over a pipe. The
-content is fetched from the pipe each time the file is opened for reading and
+content is fetched from the pipe on the first read of each open handle and
 is never written to disk.
 
 It is an independent personal project. It knows nothing about any particular
@@ -34,10 +34,15 @@ case-insensitively. Empty components, `.` / `..`, a trailing separator,
 characters that are invalid in Windows names (`< > : " | ? *`), and paths deeper
 than 32 components are rejected with exit code 2.
 
-Opening the file for reading connects to the pipe, reads until EOF and serves
-those bytes. If the pipe's server answers with its standard "Access denied" text
-the open fails with `STATUS_ACCESS_DENIED`. For every open the bridge logs the
-caller's PID and executable path, which WinFsp reports at open time.
+The first read on a handle opened for reading connects to the pipe, reads until
+EOF and serves those bytes; later reads on the same handle reuse them. Opening
+the file and closing it without reading never connects, so programs that only
+show or stat the file do not reach the server. If the pipe's server answers with
+its standard "Access denied" text the first read fails with
+`STATUS_ACCESS_DENIED`, and later reads on that handle repeat the failure without
+asking again. Two reads racing on a fresh handle share one fetch. For every open
+the bridge logs the caller's PID and executable path, which WinFsp reports at open
+time.
 
 ### Telling the server who opened the file (`--reader-info-suffix`)
 
@@ -51,10 +56,13 @@ winfsp-pipe-bridge.exe \\.\pipe\secrets K: \secrets\app\prod.env --reader-info-s
 ```
 
 The bridge then opens `\\.\pipe\secrets-reader` (the pipe name plus the suffix),
-and on every open that requests data it sends the caller's PID and process
-creation time, taken in `Open` where WinFsp reports them. The server answers for
-that caller. This is a request, not a hint: if the second pipe is missing or the
-server refuses, the open fails. The bridge never falls back to the data pipe,
+and on the first read of every handle opened for data it sends the caller's PID
+and process creation time. WinFsp reports the caller only in `Open`, so the bridge
+records them there (and keeps a handle on the process so the PID cannot be
+reused) and sends them at the first read. The server answers for that caller.
+This is a request, not a hint: if the second pipe is missing or the server
+refuses, the first read fails (`STATUS_ACCESS_DENIED` when refused,
+`STATUS_IO_DEVICE_ERROR` when the server cannot be used). The bridge never falls back to the data pipe,
 because that would make the bridge the reader.
 
 Protocol, version 1. Every message is a frame: a 4-byte big-endian body length,
@@ -125,11 +133,15 @@ Each file carries a security descriptor that lets only the user who registered i
 (and SYSTEM) open it. The names of all registrations are visible to every
 authenticated user in the root listing; the content is not.
 
-Reading: on an open that requests data the service opens the data pipe **as the
-registering user** (it keeps an impersonation token from the registering
-connection, because such a pipe is normally owner-only) and serves what it reads.
-With a reader-info suffix it speaks the protocol above on `<pipe><suffix>` and
-passes the real caller's PID and start time itself. Attribute-only opens never fetch.
+Reading: on the first read of a handle opened for data the service opens the data
+pipe **as the registering user** (it keeps an impersonation token from the
+registering connection, because such a pipe is normally owner-only) and serves what
+it reads. With a reader-info suffix it speaks the protocol above on
+`<pipe><suffix>` and passes the real caller's PID and start time, which it
+recorded in `Open`. Attribute-only opens never fetch, and neither do data opens
+that close without a read (a program that opens the file to look at it and closes
+it); a failed or refused fetch makes that read, and later reads on the handle, fail
+without asking the server again.
 
 ### Control pipe
 
@@ -150,7 +162,9 @@ Replies have `"type":"reply"` and `"status":"ok"` or `"error"`. On success
 `register` returns `path` (the file inside the mount) and `linked`. Errors carry
 `code` (`bad_request`, `bad_name`, `pipe_unreachable`, `name_in_use`, `link_refused`,
 `not_found`, `driver_not_installed`, `too_many_registrations`) and a `message`. The service pushes events, `"type":"event"`, with
-`event` of `opened`, `denied` or `error`, plus `file` and `reader_pid`.
+`event` of `opened`, `denied` or `error`, plus `file` and `reader_pid`. The event is
+pushed when the content is fetched (the first read), not at open, so browsing a
+folder that contains the file produces none.
 
 **Limits** (the pipe is open to every interactive user): a message is at most 64 KB
 (a larger one drops the connection); by default at most 64 registrations per
@@ -342,12 +356,28 @@ drive letter (default `K`):
 
 - Works with `Get-Content`, `cmd /c type`, Python and Node.
 - The caller's PID and image path are available in `Open` only; `Read` sees
-  PID 0. Approval-style checks therefore belong at open time.
-- Programs open a file several times with attribute-only access before the data
-  open. The bridge only reads the pipe for opens that request read access, so a
-  single command causes one pipe read.
-- `stat` reports size 0 (the size is unknown until a data open). Readers that
-  read to end of file are fine; tools that trust the stat size may read nothing.
+  PID 0. The programs therefore record the caller in `Open` and use it at the
+  first `Read`.
+- Programs open a file several times with attribute-only access (0x80) before the
+  data open, and some open with read access (for example 0x00120089, a plain
+  read open) and close without reading. Fetching at the first read keeps those
+  away from the server. WinFsp still delivers reads when the reported size is 0,
+  so real readers get their data.
+- Measured with a counting server (Windows 11, bridge on a drive letter): a
+  directory listing (`Get-ChildItem`, `dir`), `Get-Item`, `Test-Path`,
+  `FileInfo.Length`, `File.Exists`, `icacls`, `attrib`, a read-open that closes
+  without reading, and `Copy-Item` (CopyFile) cause no fetch. Reading programs
+  fetch: `Get-Content`, `cmd /c type`, Git for Windows `ls -la` (it opens with
+  0x00100001 and reads the first bytes of each file it lists), and also
+  `Get-Item | Select-Object *`, because the file's version-info property reads it.
+  A File Explorer window on the drive and a Windows Forms open dialog caused no
+  open of the file at all in that run (Explorer's details pane and an Electron
+  Save dialog were not measured; they were seen to open the file with read access
+  before this change).
+- The size is 0 until a handle has fetched (it is then the real length on that
+  handle). Readers that read to end of file are fine, but a program that trusts
+  the reported size and never reads sees an empty file; `Copy-Item` (CopyFile) is
+  one, so copy by reading (`Get-Content`, a stream) instead.
 - WinFsp refuses to dispatch creates unless the interface table has `Create`
   and `Overwrite`, even for a read-only volume (here they refuse writes).
 - `FileSystemName` holds 16 wide characters including the terminator; a longer

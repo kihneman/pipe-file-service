@@ -93,11 +93,20 @@ try {
     Check 'register (direct)' ($r.status -eq 'ok' -and $r.path) $r.message
     $file = $r.path
     Check 'file name is pipe-name + "-" + requested name' ($file -like "*\$base-d-.env")
+    Start-Sleep -Seconds 3   # registering made the service probe the pipe; the server logs that connection a moment late
     $before = if (Test-Path $directLog) { (Get-Content $directLog).Count } else { 0 }
     $null = Test-Path $file; $null = (Get-Item $file).Length; $null = Get-ChildItem (Split-Path $file)
     $after = if (Test-Path $directLog) { (Get-Content $directLog).Count } else { 0 }
     Check 'attribute-only opens never fetch' ($before -eq $after) "connections $before -> $after"
+    # the fetch is made by the first Read, so opening for reading and closing reaches neither the server nor the event stream
+    $h = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite'); $h.Close()
+    $after = if (Test-Path $directLog) { (Get-Content $directLog).Count } else { 0 }
+    Check 'a read-open that closes without reading never fetches' ($before -eq $after) "connections $before -> $after"
+    $null = Req $c @{ type = 'ping' }
+    Check 'no "opened" event before a real read' (@($script:events | Where-Object { $_.event -eq 'opened' }).Count -eq 0)
     Check 'read returns the pipe content' (([IO.File]::ReadAllText($file)) -eq $content)
+    $after = if (Test-Path $directLog) { (Get-Content $directLog).Count } else { 0 }
+    Check 'one read handle causes exactly one connection' ($after -eq $before + 1) "connections $before -> $after"
     $null = Req $c @{ type = 'ping' }   # events are queued ahead of the next reply
     Check 'an "opened" event was pushed' (@($script:events | Where-Object { $_.event -eq 'opened' }).Count -ge 1)
     $acl = Get-Acl $file

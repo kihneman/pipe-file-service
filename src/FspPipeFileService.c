@@ -16,7 +16,7 @@
 #include <sddl.h>
 #include <aclapi.h>
 
-#define SERVICE_VERSION "0.4.0"   // keep equal to BRIDGE_VERSION in winfsp-pipe-bridge.c
+#define SERVICE_VERSION "0.5.0"   // keep equal to BRIDGE_VERSION in winfsp-pipe-bridge.c
 #define SVC_NAME L"FspPipeFileService"
 #define SVC_DISPLAY L"WinFsp Pipe File Service"
 #define CONTROL_PIPE L"\\\\.\\pipe\\FspPipeFileService"
@@ -366,18 +366,10 @@ static HANDLE open_pipe_retry(HANDLE token, const WCHAR *name, DWORD access, BOO
     return INVALID_HANDLE_VALUE;
 }
 
-static NTSTATUS fetch_forwarded(HANDLE token, const WCHAR *info_pipe, UINT32 pid, BYTE **pdata, SIZE_T *plen)
+static NTSTATUS fetch_forwarded(HANDLE token, const WCHAR *info_pipe, UINT32 pid, UINT64 start, BYTE **pdata, SIZE_T *plen)
 {
-    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    FILETIME created, exited, kernel, user;
-    if (pid == 0 || !proc || !GetProcessTimes(proc, &created, &exited, &kernel, &user)) {
-        logf_("  cannot identify the calling process (pid %u); refusing", pid);
-        if (proc) CloseHandle(proc);
-        return STATUS_ACCESS_DENIED;
-    }
-    UINT64 start = ((UINT64)created.dwHighDateTime << 32) | created.dwLowDateTime;
     HANDLE h = open_pipe_retry(token, info_pipe, GENERIC_READ | GENERIC_WRITE, TRUE);
-    if (h == INVALID_HANDLE_VALUE) { CloseHandle(proc); return STATUS_IO_DEVICE_ERROR; }
+    if (h == INVALID_HANDLE_VALUE) return STATUS_IO_DEVICE_ERROR;
 
     char body[128];
     int blen = snprintf(body, sizeof body, "{\"protocol\":%d,\"reader_pid\":%u,\"reader_start_time\":%llu}",
@@ -406,7 +398,7 @@ static NTSTATUS fetch_forwarded(HANDLE token, const WCHAR *info_pipe, UINT32 pid
             }
         }
     }
-    CloseHandle(h); CloseHandle(proc);
+    CloseHandle(h);
     return result;
 }
 
@@ -427,7 +419,21 @@ static NTSTATUS fetch_direct(HANDLE token, const WCHAR *pipe, BYTE **pdata, SIZE
 
 // ---------------------------------------------------------------- WinFsp volume
 
-typedef struct { UINT64 id; BOOL root; BYTE *data; SIZE_T len; PVOID dirbuf; PSECURITY_DESCRIPTOR sd; SIZE_T sdsz; } Ctx;
+// The content is fetched on the first Read of a handle, not at Open: programs that
+// open the file and close it (or only stat it) never reach the data server. Open
+// records who is asking (pid, creation time, and a process handle that keeps the pid
+// from being reused) and keeps a reference on the registering connection; the first
+// Read fetches under that user's token. `lock` makes concurrent first reads on one
+// handle share one fetch; `result` is remembered so later reads repeat the outcome
+// without asking the server again.
+typedef struct {
+    UINT64 id; BOOL root; BYTE *data; SIZE_T len; PVOID dirbuf; PSECURITY_DESCRIPTOR sd; SIZE_T sdsz;
+    BOOL want_data;                       // opened with read access
+    Conn *conn;                           // reference held while want_data and not yet fetched
+    WCHAR fname[MAX_NAME + 1], pipe[MAX_PIPE + 1], info[MAX_PIPE + MAX_SUFFIX + 1];
+    UINT32 pid; UINT64 start; HANDLE proc;
+    SRWLOCK lock; BOOL done; NTSTATUS result;
+} Ctx;
 
 static PSECURITY_DESCRIPTOR g_root_sd; static SIZE_T g_root_sdsz;
 
@@ -495,6 +501,29 @@ static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *fs, PWSTR name, PUINT32 attrs
     return st;
 }
 
+// Fetches the content once per handle, on its first Read, and tells the registering
+// client who read it. A failure is remembered and repeated without asking the server
+// again: STATUS_ACCESS_DENIED when the reader was refused, STATUS_IO_DEVICE_ERROR when
+// the server could not be used.
+static NTSTATUS ensure_data(Ctx *c)
+{
+    if (!c->want_data) return STATUS_ACCESS_DENIED;
+    AcquireSRWLockExclusive(&c->lock);
+    if (!c->done) {
+        logf_("FETCH %ls pid=%u", c->fname, c->pid);
+        NTSTATUS st = c->info[0] ? fetch_forwarded(c->conn->token, c->info, c->pid, c->start, &c->data, &c->len)
+                                 : fetch_direct(c->conn->token, c->pipe, &c->data, &c->len);
+        if (NT_SUCCESS(st)) send_event(c->conn, "opened", c->fname, c->pid, NULL);
+        else send_event(c->conn, st == STATUS_ACCESS_DENIED ? "denied" : "error", c->fname, c->pid, NULL);
+        logf_("  -> 0x%08x, %zu bytes", (unsigned)st, c->len);
+        c->result = st; c->done = TRUE;
+        if (c->proc) { CloseHandle(c->proc); c->proc = NULL; }
+    }
+    NTSTATUS r = c->result;
+    ReleaseSRWLockExclusive(&c->lock);
+    return r;
+}
+
 // WinFsp refuses to dispatch creates unless Create and Overwrite exist.
 static NTSTATUS Create(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 opts, UINT32 access, UINT32 attrs,
     PSECURITY_DESCRIPTOR sd, UINT64 alloc, PVOID *pctx, FSP_FSCTL_FILE_INFO *fi)
@@ -530,18 +559,27 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 opts, UINT32 access
     if (!e) { free(c); return STATUS_OBJECT_NAME_NOT_FOUND; }
 
     UINT32 pid = FspFileSystemOperationProcessIdF();
-    NTSTATUS st = STATUS_SUCCESS;
-    // Attribute-only opens (stat, listings, AV probes) must not fetch.
+    // Opens that are not for reading data (stat, listings, AV probes) never fetch, and
+    // neither do opens that close without a Read: the first Read fetches. Here we only
+    // note who is asking.
     if (access & FILE_READ_DATA) {
         logf_("OPEN  %ls pid=%u", fname, pid);
-        st = info[0] ? fetch_forwarded(conn->token, info, pid, &c->data, &c->len)
-                     : fetch_direct(conn->token, pipe, &c->data, &c->len);
-        if (NT_SUCCESS(st)) send_event(conn, "opened", fname, pid, NULL);
-        else send_event(conn, st == STATUS_ACCESS_DENIED ? "denied" : "error", fname, pid, NULL);
-        logf_("  -> 0x%08x, %zu bytes", (unsigned)st, c->len);
+        FILETIME created, exited, kernel, user;
+        c->proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
+        if (info[0] && (!c->proc || !GetProcessTimes(c->proc, &created, &exited, &kernel, &user))) {
+            logf_("  cannot identify the calling process (pid %u); refusing", pid);
+            if (c->proc) CloseHandle(c->proc);
+            conn_unref(conn);
+            free(c->sd); free(c);
+            return STATUS_ACCESS_DENIED;
+        }
+        if (info[0]) c->start = ((UINT64)created.dwHighDateTime << 32) | created.dwLowDateTime;
+        c->want_data = TRUE; c->pid = pid; c->conn = conn;
+        wcscpy_s(c->fname, MAX_NAME + 1, fname); wcscpy_s(c->pipe, MAX_PIPE + 1, pipe);
+        wcscpy_s(c->info, MAX_PIPE + MAX_SUFFIX + 1, info);
+    } else {
+        conn_unref(conn);
     }
-    conn_unref(conn);
-    if (!NT_SUCCESS(st)) { free(c->sd); free(c); return st; }
     fill_info(c, fi);
     *pctx = c;
     return STATUS_SUCCESS;
@@ -552,6 +590,8 @@ static VOID Close(FSP_FILE_SYSTEM *fs, PVOID ctx)
     (void)fs;
     Ctx *c = (Ctx *)ctx;
     if (c->data) { SecureZeroMemory(c->data, c->len); free(c->data); }
+    if (c->proc) CloseHandle(c->proc);
+    if (c->conn) conn_unref(c->conn);
     free(c->sd);
     FspFileSystemDeleteDirectoryBuffer(&c->dirbuf);
     free(c);
@@ -562,6 +602,8 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
     (void)fs;
     Ctx *c = (Ctx *)ctx;
     if (c->root) return STATUS_INVALID_DEVICE_REQUEST;
+    NTSTATUS st = ensure_data(c);
+    if (!NT_SUCCESS(st)) return st;
     if (off >= c->len) return STATUS_END_OF_FILE;
     SIZE_T n = c->len - (SIZE_T)off; if (n > len) n = len;
     memcpy(buf, c->data + off, n);
@@ -578,7 +620,12 @@ static NTSTATUS GetSecurity(FSP_FILE_SYSTEM *fs, PVOID ctx, PSECURITY_DESCRIPTOR
 
 static NTSTATUS GetFileInfo(FSP_FILE_SYSTEM *fs, PVOID ctx, FSP_FSCTL_FILE_INFO *fi)
 {
-    (void)fs; fill_info((Ctx *)ctx, fi); return STATUS_SUCCESS;
+    (void)fs;
+    Ctx *c = (Ctx *)ctx;
+    AcquireSRWLockShared(&c->lock);   // c->len changes when the first Read fetches
+    fill_info(c, fi);
+    ReleaseSRWLockShared(&c->lock);
+    return STATUS_SUCCESS;
 }
 
 static void add_entry(Ctx *c, const WCHAR *leaf, BOOL dir, UINT64 id, NTSTATUS *result)

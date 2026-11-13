@@ -15,7 +15,7 @@
 #include <stdarg.h>
 #include <sddl.h>
 
-#define BRIDGE_VERSION "0.4.0"   // scripts/release.ps1 reads this; release tags must match it
+#define BRIDGE_VERSION "0.5.0"   // scripts/release.ps1 reads this; release tags must match it
 #define DEFAULT_PATH L"\\property-file.env"
 #define DENIED_PREFIX "Access denied: you do not have permission"
 #define MAX_DEPTH 32
@@ -33,7 +33,18 @@ static WCHAR g_prefix[MAX_DEPTH][MAX_PATH_CHARS];
 static int g_ncomp;
 
 // depth 0 is the volume root, 1..g_ncomp-1 are directories, g_ncomp is the file.
-typedef struct { int depth; BYTE *data; SIZE_T len; PVOID dirbuf; } Ctx;
+// The content is fetched on the first Read of a handle, not at Open: programs
+// that open the file and close it (or only stat it) never reach the data server.
+// Open records who is asking (pid, creation time, a process handle that keeps the
+// pid from being reused); the first Read uses that identity. `lock` makes
+// concurrent first reads on one handle share one fetch; `result` is remembered so
+// later reads repeat the outcome without asking the server again.
+typedef struct {
+    int depth; BYTE *data; SIZE_T len; PVOID dirbuf;
+    BOOL want_data;                 // opened with read access
+    UINT32 pid; UINT64 start; HANDLE proc;   // reader identity (reader-info mode)
+    SRWLOCK lock; BOOL done; NTSTATUS result;
+} Ctx;
 
 static void logf_(const char *fmt, ...)
 {
@@ -139,18 +150,8 @@ static void read_to_eof(HANDLE h, BYTE **pdata, SIZE_T *plen, SIZE_T *pcap)
 }
 
 // Asks the reader-info pipe for the content on behalf of process `pid`.
-static NTSTATUS fetch_forwarded(UINT32 pid, BYTE **pdata, SIZE_T *plen)
+static NTSTATUS fetch_forwarded(UINT32 pid, UINT64 start, BYTE **pdata, SIZE_T *plen)
 {
-    // Holding the process open keeps its PID from being reused while we ask.
-    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    FILETIME created, exited, kernel, user;
-    if (pid == 0 || !proc || !GetProcessTimes(proc, &created, &exited, &kernel, &user)) {
-        logf_("  cannot identify the calling process (pid %u); refusing", pid);
-        if (proc) CloseHandle(proc);
-        return STATUS_ACCESS_DENIED;
-    }
-    UINT64 start = ((UINT64)created.dwHighDateTime << 32) | created.dwLowDateTime;
-
     DWORD first = GetTickCount(), deadline = first + 10000;
     HANDLE h;
     for (;;) {
@@ -160,12 +161,10 @@ static NTSTATUS fetch_forwarded(UINT32 pid, BYTE **pdata, SIZE_T *plen)
         // Between instances the pipe can be briefly absent; a pipe that stays absent is an error.
         if (e == ERROR_FILE_NOT_FOUND && GetTickCount() - first >= 2000) {
             logf_("  the reader-info pipe is not served: %ls", g_reader_info_pipe);
-            CloseHandle(proc);
             return STATUS_IO_DEVICE_ERROR;
         }
         if ((e == ERROR_PIPE_BUSY || e == ERROR_FILE_NOT_FOUND) && GetTickCount() < deadline) { Sleep(50); continue; }
         logf_("  reader-info pipe open failed: %lu", e);
-        CloseHandle(proc);
         return STATUS_IO_DEVICE_ERROR;
     }
 
@@ -201,8 +200,23 @@ static NTSTATUS fetch_forwarded(UINT32 pid, BYTE **pdata, SIZE_T *plen)
         }
     }
     CloseHandle(h);
-    CloseHandle(proc);
     return result;
+}
+
+// Holding the process open from Open until Close keeps its PID from being reused
+// while the handle waits for its first Read.
+static NTSTATUS identify_reader(Ctx *c, UINT32 pid)
+{
+    FILETIME created, exited, kernel, user;
+    c->proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
+    if (!c->proc || !GetProcessTimes(c->proc, &created, &exited, &kernel, &user)) {
+        logf_("  cannot identify the calling process (pid %u); refusing", pid);
+        if (c->proc) { CloseHandle(c->proc); c->proc = NULL; }
+        return STATUS_ACCESS_DENIED;
+    }
+    c->pid = pid;
+    c->start = ((UINT64)created.dwHighDateTime << 32) | created.dwLowDateTime;
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS fetch(BYTE **pdata, SIZE_T *plen)
@@ -233,6 +247,26 @@ static NTSTATUS fetch(BYTE **pdata, SIZE_T *plen)
     }
     *pdata = buf; *plen = len;
     return STATUS_SUCCESS;
+}
+
+// Fetches the content once per handle, on its first Read. A failure is remembered
+// and repeated without asking the server again: STATUS_ACCESS_DENIED when the reader
+// was refused, STATUS_IO_DEVICE_ERROR when the server could not be used.
+static NTSTATUS ensure_data(Ctx *c)
+{
+    if (!c->want_data) return STATUS_ACCESS_DENIED;
+    AcquireSRWLockExclusive(&c->lock);
+    if (!c->done) {
+        logf_("FETCH pid=%u", c->pid);
+        c->result = c->proc ? fetch_forwarded(c->pid, c->start, &c->data, &c->len)
+                            : fetch(&c->data, &c->len);
+        c->done = TRUE;
+        logf_("  -> 0x%08x, %zu bytes", (unsigned)c->result, c->len);
+        if (c->proc) { CloseHandle(c->proc); c->proc = NULL; }
+    }
+    NTSTATUS r = c->result;
+    ReleaseSRWLockExclusive(&c->lock);
+    return r;
 }
 
 static void fill_info(const Ctx *c, FSP_FSCTL_FILE_INFO *fi)
@@ -320,15 +354,16 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 opts, UINT32 access
     if (is_file(depth)) {
         char who[600]; caller(who, sizeof who);
         logf_("OPEN  %ls access=0x%08x %s", name, access, who);
-        // Attribute-only opens (stat, directory listings, AV probes) must not read the secret.
-        NTSTATUS st = STATUS_SUCCESS;
+        // Opens that are not for reading data (stat, directory listings, AV probes) never
+        // read the secret, and neither do opens that close without a Read: the fetch is
+        // made by the first Read. Here we only note who is asking.
         if (access & FILE_READ_DATA) {
-            st = g_reader_info_pipe[0]
-                ? fetch_forwarded(FspFileSystemOperationProcessIdF(), &c->data, &c->len)
-                : fetch(&c->data, &c->len);
+            c->want_data = TRUE;
+            if (g_reader_info_pipe[0]) {
+                NTSTATUS st = identify_reader(c, FspFileSystemOperationProcessIdF());
+                if (!NT_SUCCESS(st)) { free(c); logf_("  -> 0x%08x", (unsigned)st); return st; }
+            }
         }
-        if (!NT_SUCCESS(st)) { free(c); logf_("  -> 0x%08x", (unsigned)st); return st; }
-        logf_("  -> %zu bytes", c->len);
     }
     fill_info(c, fi);
     *pctx = c;
@@ -341,6 +376,7 @@ static VOID Close(FSP_FILE_SYSTEM *fs, PVOID ctx)
     Ctx *c = (Ctx *)ctx;
     if (is_file(c->depth)) logf_("CLOSE");
     if (c->data) { SecureZeroMemory(c->data, c->len); free(c->data); }
+    if (c->proc) CloseHandle(c->proc);
     FspFileSystemDeleteDirectoryBuffer(&c->dirbuf);
     free(c);
 }
@@ -350,6 +386,8 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
     (void)fs;
     Ctx *c = (Ctx *)ctx;
     if (!is_file(c->depth)) return STATUS_INVALID_DEVICE_REQUEST;
+    NTSTATUS st = ensure_data(c);
+    if (!NT_SUCCESS(st)) return st;
     if (off >= c->len) return STATUS_END_OF_FILE;
     SIZE_T n = c->len - (SIZE_T)off; if (n > len) n = len;
     memcpy(buf, c->data + off, n);
@@ -359,7 +397,12 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
 
 static NTSTATUS GetFileInfo(FSP_FILE_SYSTEM *fs, PVOID ctx, FSP_FSCTL_FILE_INFO *fi)
 {
-    (void)fs; fill_info((Ctx *)ctx, fi); return STATUS_SUCCESS;
+    (void)fs;
+    Ctx *c = (Ctx *)ctx;
+    AcquireSRWLockShared(&c->lock);   // c->len changes when the first Read fetches
+    fill_info(c, fi);
+    ReleaseSRWLockShared(&c->lock);
+    return STATUS_SUCCESS;
 }
 
 static void add_entry(Ctx *c, const WCHAR *leaf, BOOL dir, NTSTATUS *result)

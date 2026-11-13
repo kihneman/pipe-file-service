@@ -13,7 +13,7 @@ function Check($name, $ok, $detail) {
     if ($ok) { "PASS  $name" } else { "FAIL  $name   $detail"; $script:failures++ }
 }
 
-foreach ($name in 'driver-missing', 'limits', 'smoke', 'service-smoke', 'install-chain') {
+foreach ($name in 'driver-missing', 'limits', 'smoke', 'lazy-fetch', 'service-smoke', 'install-chain') {
     $lines = @(Get-Content (Join-Path $PSScriptRoot "$name.ps1") | Where-Object { $_.Trim() })
     Check "$name.ps1 ends with an explicit exit" ($lines[-1] -match '^\s*exit\b') $lines[-1]
 }
