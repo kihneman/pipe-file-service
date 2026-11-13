@@ -86,3 +86,4 @@ finally {
     foreach ($s in $script:servers) { $s.Dispose() }
 }
 if ($script:failures) { "$($script:failures) FAILED"; exit 1 } else { 'ALL PASSED' }
+exit 0   # explicit: otherwise a leftover $LASTEXITCODE from a native command becomes the exit code
