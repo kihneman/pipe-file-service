@@ -1,15 +1,11 @@
 // PipeFileService: a Windows service that shows named pipes as read-only
-// files on one WinFsp volume and turns placeholder files into symlinks to
+// files on one volume of a user-mode file system driver (see pfs_backend.h) and turns placeholder files into symlinks to
 // them. It is the privileged counterpart of pipe-file-mount.exe: any local
 // user's app asks it over a control pipe, and only a privileged process may
 // create file symlinks without Developer Mode. The protocol is in the README.
 //
-// MIT licensed. Uses WinFsp - Windows File System Proxy,
-// Copyright (C) Bill Zissimopoulos - https://github.com/winfsp/winfsp
-#define _CRT_SECURE_NO_WARNINGS
-#define UNICODE
-#define _UNICODE
-#include <winfsp/winfsp.h>
+// MIT licensed. This file is driver independent; the backend that is linked with it carries the driver's notices.
+#include "pfs_backend.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -24,7 +20,6 @@
 #define PARAM_KEY L"SYSTEM\\CurrentControlSet\\Services\\" SVC_NAME L"\\Parameters"
 #define PIPE_PREFIX L"\\\\.\\pipe\\"
 #define DENIED_PREFIX "Access denied: you do not have permission"
-#define MAX_NAME 255
 #define MAX_PIPE 256
 #define MAX_SUFFIX 64
 #define MAX_PATHW 1024
@@ -417,7 +412,7 @@ static NTSTATUS fetch_direct(HANDLE token, const WCHAR *pipe, BYTE **pdata, SIZE
     return STATUS_SUCCESS;
 }
 
-// ---------------------------------------------------------------- WinFsp volume
+// ---------------------------------------------------------------- the files the backend serves
 
 // The content is fetched on the first Read of a handle, not at Open: programs that
 // open the file and close it (or only stat it) never reach the data server. Open
@@ -427,7 +422,7 @@ static NTSTATUS fetch_direct(HANDLE token, const WCHAR *pipe, BYTE **pdata, SIZE
 // handle share one fetch; `result` is remembered so later reads repeat the outcome
 // without asking the server again.
 typedef struct {
-    UINT64 id; BOOL root; BYTE *data; SIZE_T len; PVOID dirbuf; PSECURITY_DESCRIPTOR sd; SIZE_T sdsz;
+    UINT64 id; BOOL root; BYTE *data; SIZE_T len; PSECURITY_DESCRIPTOR sd; SIZE_T sdsz;
     BOOL want_data;                       // opened with read access
     Conn *conn;                           // reference held while want_data and not yet fetched
     WCHAR fname[MAX_NAME + 1], pipe[MAX_PIPE + 1], info[MAX_PIPE + MAX_SUFFIX + 1];
@@ -450,23 +445,20 @@ static Entry *find_by_name(const WCHAR *name)   // g_lock held
     return NULL;
 }
 
-static void fill_info(const Ctx *c, FSP_FSCTL_FILE_INFO *fi)
+UINT64 pfs_time(void) { return g_now; }
+void pfs_log(const char *fmt, ...)
 {
-    memset(fi, 0, sizeof *fi);
-    fi->FileAttributes = c->root ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_READONLY;
-    fi->FileSize = c->root ? 0 : c->len;
-    fi->AllocationSize = (fi->FileSize + 4095) / 4096 * 4096;
-    fi->CreationTime = fi->LastAccessTime = fi->LastWriteTime = fi->ChangeTime = g_now;
-    fi->IndexNumber = c->id;
+    char msg[512];
+    va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof msg, fmt, ap); va_end(ap);
+    logf_("%s", msg);
 }
 
-static NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM *fs, FSP_FSCTL_VOLUME_INFO *vi)
+static void fill_info(const Ctx *c, PfsInfo *i)
 {
-    (void)fs;
-    vi->TotalSize = 1 << 20; vi->FreeSize = 0;
-    vi->VolumeLabelLength = (UINT16)(sizeof(L"PipeFiles") - sizeof(WCHAR));
-    memcpy(vi->VolumeLabel, L"PipeFiles", vi->VolumeLabelLength);
-    return STATUS_SUCCESS;
+    i->dir = c->root;
+    i->size = c->root ? 0 : c->len;
+    i->id = c->id;
+    i->time = g_now;
 }
 
 static NTSTATUS copy_sd(PSECURITY_DESCRIPTOR from, SIZE_T fromsz, PSECURITY_DESCRIPTOR sd, SIZE_T *sdsz)
@@ -482,11 +474,10 @@ static NTSTATUS copy_sd(PSECURITY_DESCRIPTOR from, SIZE_T fromsz, PSECURITY_DESC
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *fs, PWSTR name, PUINT32 attrs, PSECURITY_DESCRIPTOR sd, SIZE_T *sdsz)
+NTSTATUS pfs_stat(const WCHAR *name, BOOL *dir, PSECURITY_DESCRIPTOR sd, SIZE_T *sdsz)
 {
-    (void)fs;
     if (0 == wcscmp(name, L"\\")) {
-        if (attrs) *attrs = FILE_ATTRIBUTE_DIRECTORY;
+        *dir = TRUE;
         return copy_sd(g_root_sd, g_root_sdsz, sd, sdsz);
     }
     if (name[0] != L'\\' || wcschr(name + 1, L'\\')) return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -494,7 +485,7 @@ static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *fs, PWSTR name, PUINT32 attrs
     EnterCriticalSection(&g_lock);
     Entry *e = find_by_name(name + 1);
     if (e) {
-        if (attrs) *attrs = FILE_ATTRIBUTE_READONLY;
+        *dir = FALSE;
         st = copy_sd(e->sd, e->sdsz, sd, sdsz);
     }
     LeaveCriticalSection(&g_lock);
@@ -524,27 +515,12 @@ static NTSTATUS ensure_data(Ctx *c)
     return r;
 }
 
-// WinFsp refuses to dispatch creates unless Create and Overwrite exist.
-static NTSTATUS Create(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 opts, UINT32 access, UINT32 attrs,
-    PSECURITY_DESCRIPTOR sd, UINT64 alloc, PVOID *pctx, FSP_FSCTL_FILE_INFO *fi)
+NTSTATUS pfs_open(const WCHAR *name, UINT32 access, UINT32 pid, void **pfile, PfsInfo *info)
 {
-    (void)fs; (void)name; (void)opts; (void)access; (void)attrs; (void)sd; (void)alloc; (void)pctx; (void)fi;
-    return STATUS_MEDIA_WRITE_PROTECTED;
-}
-
-static NTSTATUS Overwrite(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT32 attrs, BOOLEAN replace, UINT64 alloc, FSP_FSCTL_FILE_INFO *fi)
-{
-    (void)fs; (void)ctx; (void)attrs; (void)replace; (void)alloc; (void)fi;
-    return STATUS_MEDIA_WRITE_PROTECTED;
-}
-
-static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 opts, UINT32 access, PVOID *pctx, FSP_FSCTL_FILE_INFO *fi)
-{
-    (void)fs; (void)opts;
     Ctx *c = (Ctx *)calloc(1, sizeof *c);
-    if (0 == wcscmp(name, L"\\")) { c->root = TRUE; c->id = 1; fill_info(c, fi); *pctx = c; return STATUS_SUCCESS; }
+    if (0 == wcscmp(name, L"\\")) { c->root = TRUE; c->id = 1; fill_info(c, info); *pfile = c; return STATUS_SUCCESS; }
 
-    WCHAR fname[MAX_NAME + 1], pipe[MAX_PIPE + 1], info[MAX_PIPE + MAX_SUFFIX + 1];
+    WCHAR fname[MAX_NAME + 1], pipe[MAX_PIPE + 1], infop[MAX_PIPE + MAX_SUFFIX + 1];
     Conn *conn = NULL;
     EnterCriticalSection(&g_lock);
     Entry *e = (name[0] == L'\\' && !wcschr(name + 1, L'\\')) ? find_by_name(name + 1) : NULL;
@@ -552,13 +528,12 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 opts, UINT32 access
         c->id = e->id;
         c->sd = malloc(e->sdsz); memcpy(c->sd, e->sd, e->sdsz); c->sdsz = e->sdsz;
         wcscpy_s(fname, MAX_NAME + 1, e->name); wcscpy_s(pipe, MAX_PIPE + 1, e->pipe);
-        wcscpy_s(info, MAX_PIPE + MAX_SUFFIX + 1, e->info_pipe);
+        wcscpy_s(infop, MAX_PIPE + MAX_SUFFIX + 1, e->info_pipe);
         conn = e->conn; InterlockedIncrement(&conn->refs);
     }
     LeaveCriticalSection(&g_lock);
     if (!e) { free(c); return STATUS_OBJECT_NAME_NOT_FOUND; }
 
-    UINT32 pid = FspFileSystemOperationProcessIdF();
     // Opens that are not for reading data (stat, listings, AV probes) never fetch, and
     // neither do opens that close without a Read: the first Read fetches. Here we only
     // note who is asking.
@@ -566,41 +541,38 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 opts, UINT32 access
         logf_("OPEN  %ls pid=%u", fname, pid);
         FILETIME created, exited, kernel, user;
         c->proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
-        if (info[0] && (!c->proc || !GetProcessTimes(c->proc, &created, &exited, &kernel, &user))) {
+        if (infop[0] && (!c->proc || !GetProcessTimes(c->proc, &created, &exited, &kernel, &user))) {
             logf_("  cannot identify the calling process (pid %u); refusing", pid);
             if (c->proc) CloseHandle(c->proc);
             conn_unref(conn);
             free(c->sd); free(c);
             return STATUS_ACCESS_DENIED;
         }
-        if (info[0]) c->start = ((UINT64)created.dwHighDateTime << 32) | created.dwLowDateTime;
+        if (infop[0]) c->start = ((UINT64)created.dwHighDateTime << 32) | created.dwLowDateTime;
         c->want_data = TRUE; c->pid = pid; c->conn = conn;
         wcscpy_s(c->fname, MAX_NAME + 1, fname); wcscpy_s(c->pipe, MAX_PIPE + 1, pipe);
-        wcscpy_s(c->info, MAX_PIPE + MAX_SUFFIX + 1, info);
+        wcscpy_s(c->info, MAX_PIPE + MAX_SUFFIX + 1, infop);
     } else {
         conn_unref(conn);
     }
-    fill_info(c, fi);
-    *pctx = c;
+    fill_info(c, info);
+    *pfile = c;
     return STATUS_SUCCESS;
 }
 
-static VOID Close(FSP_FILE_SYSTEM *fs, PVOID ctx)
+void pfs_close(void *file)
 {
-    (void)fs;
-    Ctx *c = (Ctx *)ctx;
+    Ctx *c = (Ctx *)file;
     if (c->data) { SecureZeroMemory(c->data, c->len); free(c->data); }
     if (c->proc) CloseHandle(c->proc);
     if (c->conn) conn_unref(c->conn);
     free(c->sd);
-    FspFileSystemDeleteDirectoryBuffer(&c->dirbuf);
     free(c);
 }
 
-static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULONG len, PULONG done)
+NTSTATUS pfs_read(void *file, UINT64 off, ULONG len, void *buf, ULONG *done)
 {
-    (void)fs;
-    Ctx *c = (Ctx *)ctx;
+    Ctx *c = (Ctx *)file;
     if (c->root) return STATUS_INVALID_DEVICE_REQUEST;
     NTSTATUS st = ensure_data(c);
     if (!NT_SUCCESS(st)) return st;
@@ -611,58 +583,27 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS GetSecurity(FSP_FILE_SYSTEM *fs, PVOID ctx, PSECURITY_DESCRIPTOR sd, SIZE_T *sdsz)
+NTSTATUS pfs_get_security(void *file, PSECURITY_DESCRIPTOR sd, SIZE_T *sdsz)
 {
-    (void)fs;
-    Ctx *c = (Ctx *)ctx;
+    Ctx *c = (Ctx *)file;
     return c->root ? copy_sd(g_root_sd, g_root_sdsz, sd, sdsz) : copy_sd(c->sd, c->sdsz, sd, sdsz);
 }
 
-static NTSTATUS GetFileInfo(FSP_FILE_SYSTEM *fs, PVOID ctx, FSP_FSCTL_FILE_INFO *fi)
+NTSTATUS pfs_get_info(void *file, PfsInfo *info)
 {
-    (void)fs;
-    Ctx *c = (Ctx *)ctx;
+    Ctx *c = (Ctx *)file;
     AcquireSRWLockShared(&c->lock);   // c->len changes when the first Read fetches
-    fill_info(c, fi);
+    fill_info(c, info);
     ReleaseSRWLockShared(&c->lock);
     return STATUS_SUCCESS;
 }
 
-static void add_entry(Ctx *c, const WCHAR *leaf, BOOL dir, UINT64 id, NTSTATUS *result)
+void pfs_list(BOOL (*visit)(void *ctx, const WCHAR *name, UINT64 id), void *ctx)
 {
-    union { UINT8 b[sizeof(FSP_FSCTL_DIR_INFO) + (MAX_NAME + 1) * sizeof(WCHAR)]; FSP_FSCTL_DIR_INFO d; } u;
-    memset(&u, 0, sizeof u);
-    size_t bytes = wcslen(leaf) * sizeof(WCHAR);
-    u.d.Size = (UINT16)(FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf) + bytes);
-    u.d.FileInfo.FileAttributes = dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_READONLY;
-    u.d.FileInfo.IndexNumber = id;
-    u.d.FileInfo.CreationTime = u.d.FileInfo.LastAccessTime = u.d.FileInfo.LastWriteTime = u.d.FileInfo.ChangeTime = g_now;
-    memcpy(u.d.FileNameBuf, leaf, bytes);
-    FspFileSystemFillDirectoryBuffer(&c->dirbuf, &u.d, result);
+    EnterCriticalSection(&g_lock);
+    for (Entry *e = g_entries; e; e = e->next) if (!visit(ctx, e->name, e->id)) break;
+    LeaveCriticalSection(&g_lock);
 }
-
-static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR pattern, PWSTR marker, PVOID buf, ULONG len, PULONG done)
-{
-    (void)fs; (void)pattern;
-    Ctx *c = (Ctx *)ctx;
-    if (!c->root) return STATUS_NOT_A_DIRECTORY;
-    NTSTATUS result;
-    if (FspFileSystemAcquireDirectoryBuffer(&c->dirbuf, 0 == marker, &result)) {
-        EnterCriticalSection(&g_lock);
-        for (Entry *e = g_entries; e && NT_SUCCESS(result); e = e->next) add_entry(c, e->name, FALSE, e->id, &result);
-        LeaveCriticalSection(&g_lock);
-        FspFileSystemReleaseDirectoryBuffer(&c->dirbuf);
-    }
-    if (!NT_SUCCESS(result)) return result;
-    FspFileSystemReadDirectoryBuffer(&c->dirbuf, marker, buf, len, done);
-    return STATUS_SUCCESS;
-}
-
-static FSP_FILE_SYSTEM_INTERFACE g_iface = {
-    .GetVolumeInfo = GetVolumeInfo, .GetSecurityByName = GetSecurityByName,
-    .Create = Create, .Overwrite = Overwrite, .Open = Open, .Close = Close,
-    .Read = Read, .GetSecurity = GetSecurity, .GetFileInfo = GetFileInfo, .ReadDirectory = ReadDirectory,
-};
 
 // ---------------------------------------------------------------- the placeholder-file link
 
@@ -796,8 +737,6 @@ static BOOL probe_pipe(Conn *c, const WCHAR *name, DWORD access, DWORD *err)
     return *err == ERROR_PIPE_BUSY;   // exists, all instances busy
 }
 
-static BOOL winfsp_installed(void);
-
 static void do_register(Conn *c, const Json *j, const WCHAR *id)
 {
     const WCHAR *pipe = jget(j, L"pipe"), *file = jget(j, L"file_name");
@@ -806,8 +745,11 @@ static void do_register(Conn *c, const Json *j, const WCHAR *id)
     WCHAR name[MAX_NAME + 1];
     const char *why = build_volume_name(pipe, file, name);
     if (why) { send_reply(c, id, "error", "bad_name", why, NULL, -1); return; }
-    // WinFsp can be removed while the service runs: existing registrations are left alone (they fail by themselves).
-    if (!winfsp_installed()) { send_reply(c, id, "error", "driver_not_installed", "WinFsp is not installed; install it and try again", NULL, -1); return; }
+    // The driver can be removed while the service runs: existing registrations are left alone (they fail by themselves).
+    if (!pfs_backend.installed()) {
+        char m[128]; snprintf(m, sizeof m, "%ls is not installed; install it and try again", pfs_backend.driver_name);
+        send_reply(c, id, "error", "driver_not_installed", m, NULL, -1); return;
+    }
     if (suffix && (wcslen(suffix) == 0 || wcslen(suffix) > MAX_SUFFIX || wcschr(suffix, L'\\') || wcschr(suffix, L'/'))) {
         send_reply(c, id, "error", "bad_request", "reader_info_suffix must be 1 to 64 characters without a path separator", NULL, -1); return;
     }
@@ -1022,54 +964,6 @@ static DWORD WINAPI accept_thread(LPVOID arg)
     CloseHandle(ev);
     return 0;
 }
-
-// ---------------------------------------------------------------- is WinFsp installed?
-
-static WCHAR g_winfsp_dir[MAX_PATHW];   // development override (run mode only); empty = use the registry and the driver service
-
-// WinFsp 2.x registers its file system driver under a unique name, "WinFsp+<timestamp>", so look for
-// a file system driver service whose name starts with "WinFsp".
-static BOOL winfsp_driver_registered(void)
-{
-    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_ENUMERATE_SERVICE);
-    if (!scm) return TRUE;   // cannot ask; the DLL is there, so let the real load decide
-    BOOL found = FALSE;
-    DWORD cap = 64 * 1024, need = 0, count = 0, resume = 0;
-    BYTE *buf = (BYTE *)malloc(cap);
-    for (;;) {
-        BOOL ok = EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_FILE_SYSTEM_DRIVER, SERVICE_STATE_ALL,
-            buf, cap, &need, &count, &resume, NULL);
-        DWORD err = ok ? 0 : GetLastError();
-        if (!ok && err != ERROR_MORE_DATA) { found = TRUE; break; }   // cannot tell: let the real load decide
-        ENUM_SERVICE_STATUS_PROCESSW *svc = (ENUM_SERVICE_STATUS_PROCESSW *)buf;
-        for (DWORD i = 0; i < count && !found; i++)
-            found = 0 == _wcsnicmp(svc[i].lpServiceName, L"" FSP_FSCTL_DRIVER_NAME, wcslen(L"" FSP_FSCTL_DRIVER_NAME))
-                && (svc[i].lpServiceName[wcslen(L"" FSP_FSCTL_DRIVER_NAME)] == 0 || svc[i].lpServiceName[wcslen(L"" FSP_FSCTL_DRIVER_NAME)] == L'+');
-        if (ok || found) break;
-    }
-    free(buf);
-    CloseServiceHandle(scm);
-    return found;
-}
-
-// True when WinFsp is installed: the DLL FspLoad() would load is where the registry says, and the
-// WinFsp driver service exists. Touches no WinFsp code, so it is safe before the delay-loaded DLL is.
-static BOOL winfsp_installed(void)
-{
-    WCHAR path[MAX_PATHW];
-    if (g_winfsp_dir[0]) {
-        swprintf_s(path, MAX_PATHW, L"%ls\\bin\\winfsp-x64.dll", g_winfsp_dir);
-        return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
-    }
-    WCHAR dir[MAX_PATH];
-    DWORD sz = sizeof dir;
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"" FSP_FSCTL_PRODUCT_FULL_REGKEY, L"InstallDir", RRF_RT_REG_SZ, NULL, dir, &sz) != ERROR_SUCCESS)
-        return FALSE;
-    swprintf_s(path, MAX_PATHW, L"%ls\\bin\\winfsp-x64.dll", dir);
-    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return FALSE;
-    return winfsp_driver_registered();
-}
-
 // ---------------------------------------------------------------- serving
 
 static BOOL enable_privilege(const WCHAR *name)
@@ -1087,12 +981,12 @@ static BOOL enable_privilege(const WCHAR *name)
 
 static int serve(const WCHAR *mount)
 {
-    if (!winfsp_installed()) {
-        // Normal exit, no control pipe, nothing polling: start the service again once WinFsp is installed.
-        logf_("WinFsp is not installed (get it from https://winfsp.dev/); exiting without opening the control pipe. Start the service again after installing it.");
+    if (!pfs_backend.installed()) {
+        // Normal exit, no control pipe, nothing polling: start the service again once the driver is installed.
+        logf_("%ls is not installed (get it from %s); exiting without opening the control pipe. Start the service again after installing it.",
+            pfs_backend.driver_name, pfs_backend.driver_url);
         return 0;
     }
-    if (!NT_SUCCESS(FspLoad(0))) { logf_("WinFsp is installed but cannot be loaded. Get it from https://winfsp.dev/"); return 11; }
     InitializeCriticalSection(&g_lock);
     wcscpy_s(g_mount, MAX_PATHW, mount);
     size_t ml = wcslen(g_mount);
@@ -1102,35 +996,8 @@ static int serve(const WCHAR *mount)
     if (!enable_privilege(L"SeCreateSymbolicLinkPrivilege")) logf_("warning: SeCreateSymbolicLinkPrivilege is not available; links will fail");
     if (!sddl_to_sd(L"O:SYG:SYD:P(A;;FA;;;SY)(A;;FRFX;;;AU)", &g_root_sd, &g_root_sdsz)) { logf_("cannot build the root security descriptor"); return 12; }
 
-    // A WinFsp mount point folder must not exist: create the parent, clear an empty leftover.
-    if (g_mount[1] == L':' && g_mount[2] == L'\\') {
-        WCHAR parent[MAX_PATHW]; wcscpy_s(parent, MAX_PATHW, g_mount);
-        WCHAR *slash = wcsrchr(parent, L'\\');
-        if (slash && slash > parent + 2) {
-            *slash = 0;
-            WCHAR *up = wcsrchr(parent, L'\\');
-            if (up && up > parent + 2) { *up = 0; CreateDirectoryW(parent, NULL); *up = L'\\'; }
-            CreateDirectoryW(parent, NULL);
-        }
-        RemoveDirectoryW(g_mount);   // succeeds only for an empty leftover folder
-    }
-
-    FSP_FSCTL_VOLUME_PARAMS vp; memset(&vp, 0, sizeof vp);
-    vp.SectorSize = 512; vp.SectorsPerAllocationUnit = 1;
-    vp.VolumeCreationTime = g_now;
-    vp.FileInfoTimeout = 1000;
-    vp.CasePreservedNames = 1; vp.UnicodeOnDisk = 1; vp.PersistentAcls = 1;
-    vp.FlushAndPurgeOnCleanup = 1;
-    vp.UmFileContextIsUserContext2 = 1; vp.PostCleanupWhenModifiedOnly = 1;
-    wcscpy_s(vp.FileSystemName, sizeof vp.FileSystemName / sizeof(WCHAR), L"PipeFiles");
-
-    FSP_FILE_SYSTEM *fs = NULL;
-    NTSTATUS st = FspFileSystemCreate(L"" FSP_FSCTL_DISK_DEVICE_NAME, &vp, &g_iface, &fs);
-    if (!NT_SUCCESS(st)) { logf_("FspFileSystemCreate failed: 0x%08x", (unsigned)st); return 13; }
-    st = FspFileSystemSetMountPoint(fs, g_mount);
-    if (!NT_SUCCESS(st)) { logf_("SetMountPoint %ls failed: 0x%08x", g_mount, (unsigned)st); FspFileSystemDelete(fs); return 14; }
-    st = FspFileSystemStartDispatcher(fs, 0);
-    if (!NT_SUCCESS(st)) { logf_("StartDispatcher failed: 0x%08x", (unsigned)st); FspFileSystemDelete(fs); return 15; }
+    int rc = pfs_backend.start(g_mount);
+    if (rc) return rc;
 
     HANDLE acc = CreateThread(NULL, 0, accept_thread, NULL, 0, NULL);
     logf_("serving on %ls; control pipe %ls", g_mount, CONTROL_PIPE);
@@ -1149,11 +1016,11 @@ static int serve(const WCHAR *mount)
     EnterCriticalSection(&g_lock);
     while (g_entries) remove_entry_locked(g_entries);
     LeaveCriticalSection(&g_lock);
-    FspFileSystemStopDispatcher(fs);
-    FspFileSystemDelete(fs);
+    pfs_backend.stop();
     logf_("stopped");
     return 0;
 }
+
 
 // ---------------------------------------------------------------- service plumbing
 
@@ -1265,7 +1132,9 @@ static int install(const WCHAR *mount, BOOL auto_start)
     SC_HANDLE s = CreateServiceW(scm, SVC_NAME, SVC_DISPLAY, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
         auto_start ? SERVICE_AUTO_START : SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, cmd, NULL, NULL, NULL, NULL, NULL);
     if (!s) { fprintf(stderr, "CreateService failed: %lu\n", GetLastError()); CloseServiceHandle(scm); return 1; }
-    SERVICE_DESCRIPTIONW d = { L"Shows named pipes as read-only files on a WinFsp volume and links placeholder files to them." };
+    WCHAR desc[160];
+    swprintf_s(desc, 160, L"Shows named pipes as read-only files on a %ls volume and links placeholder files to them.", pfs_backend.driver_name);
+    SERVICE_DESCRIPTIONW d = { desc };
     ChangeServiceConfig2W(s, SERVICE_CONFIG_DESCRIPTION, &d);
     // A restricted service SID makes the token write-restricted: the service then cannot create its
     // folder or reopen a user's placeholder (checked live), so use a plain, unrestricted service SID.
@@ -1308,17 +1177,20 @@ static int uninstall(void)
 
 static int usage(void)
 {
+    WCHAR syn[160] = L"";
+    if (pfs_backend.run_option_synopsis) swprintf_s(syn, 160, L" [%ls]", pfs_backend.run_option_synopsis);
     fwprintf(stderr,
         L"usage: PipeFileService <command>\n"
         L"  install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [limits]   (elevated)\n"
         L"  uninstall                                                           (elevated)\n"
-        L"  run [--mount <...>] [--winfsp-dir <folder>] [limits]   run in this console (elevated), for development;\n"
+        L"  run [--mount <...>]%ls [limits]   run in this console (elevated), for development;\n"
         L"  limits on the control pipe (defaults in brackets; install keeps them for the service):\n"
         L"      --max-reg-per-conn <n> [64]   --max-reg-per-user <n> [256]\n"
         L"      --max-conn <n> [128]          --max-conn-per-user <n> [16]\n"
-        L"      --winfsp-dir makes the WinFsp check look for <folder>\\bin\\winfsp-x64.dll instead of the real install\n"
+        L"      %ls\n"
         L"  --version\n"
-        L"default mount: %ls\n", DEFAULT_MOUNT);
+        L"default mount: %ls\n",
+        syn, pfs_backend.run_option_help ? pfs_backend.run_option_help : L"", DEFAULT_MOUNT);
     return 2;
 }
 
@@ -1352,7 +1224,7 @@ int wmain(int argc, wchar_t **argv)
     else for (int i = 2; i < argc; i++) {
         if (0 == wcscmp(argv[i], L"--mount") && i + 1 < argc && argv[i + 1][0]) mount = argv[++i];
         else if (is_install && 0 == wcscmp(argv[i], L"--auto-start")) auto_start = TRUE;
-        else if (is_run && 0 == wcscmp(argv[i], L"--winfsp-dir") && i + 1 < argc && argv[i + 1][0]) wcscpy_s(g_winfsp_dir, MAX_PATHW, argv[++i]);   // never read in service mode
+        else if (is_run && i + 1 < argc && pfs_backend.parse_run_option && pfs_backend.parse_run_option(argv[i], argv[i + 1])) i++;   // never read in service mode
         else if ((is_install || is_run) && i + 1 < argc && parse_limit_arg(argv[i], argv[i + 1])) i++;
         else return usage();
     }
