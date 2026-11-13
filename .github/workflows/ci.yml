@@ -30,11 +30,11 @@ jobs:
       - name: Check the binary starts
         shell: pwsh
         run: |
-          $out = ./winfsp-pipe-bridge.exe --version
-          if ($LASTEXITCODE -ne 0 -or $out -notmatch '^winfsp-pipe-bridge \d') { throw "unexpected output: $out" }
+          $out = ./pipe-file-mount.exe --version
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch '^pipe-file-mount \d') { throw "unexpected output: $out" }
           $out
-          $out = ./FspPipeFileService.exe --version
-          if ($LASTEXITCODE -ne 0 -or $out -notmatch '^FspPipeFileService \d') { throw "unexpected output: $out" }
+          $out = ./PipeFileService.exe --version
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch '^PipeFileService \d') { throw "unexpected output: $out" }
           $out
 
       # The same packaging a release uses; checked with GNU sha256sum, which

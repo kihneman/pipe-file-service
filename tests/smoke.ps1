@@ -1,14 +1,14 @@
-# Smoke test: serves a named pipe from this script, mounts it with the bridge
+# Smoke test: serves a named pipe from this script, mounts it with the mount tool
 # and checks reads, nested paths, rejected paths and unmount. Needs WinFsp
-# installed and winfsp-pipe-bridge.exe built (see ..\build.ps1). Windows
+# installed and pipe-file-mount.exe built (see ..\build.ps1). Windows
 # PowerShell 5.1 or later; use a free drive letter.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\winfsp-pipe-bridge.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\pipe-file-mount.exe'),
     [string]$Drive = 'K'
 )
 $ErrorActionPreference = 'Stop'
 $env:PATH = "C:\Program Files (x86)\WinFsp\bin;$env:PATH"
-$pipeName = "winfsp-pipe-bridge-smoke-$PID"
+$pipeName = "pipe-file-mount-smoke-$PID"
 $content = "# smoke`nKEY=value`nQUOTED=`"a \`"b\`" c`"`n"
 $script:failures = 0
 
@@ -28,7 +28,7 @@ $server = Start-Job -ArgumentList $pipeName, $content -ScriptBlock {
 }
 Start-Sleep -Seconds 1
 
-function Start-Bridge($path) {
+function Start-Mount($path) {
     $a = @("\\.\pipe\$pipeName", "${Drive}:"); if ($path) { $a += $path }
     $p = Start-Process -FilePath $Exe -ArgumentList $a -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 3
@@ -36,7 +36,7 @@ function Start-Bridge($path) {
     New-PSDrive -Name $Drive -PSProvider FileSystem -Root "${Drive}:\" -Scope Global -ErrorAction SilentlyContinue | Out-Null
     $p
 }
-function Stop-Bridge($p) {
+function Stop-Mount($p) {
     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1
     Remove-PSDrive -Name $Drive -Force -ErrorAction SilentlyContinue
 }
@@ -48,12 +48,12 @@ try {
         Check "rejects path $bad" ($p.ExitCode -eq 2)
     }
 
-    $p = Start-Bridge $null
+    $p = Start-Mount $null
     Check 'default path is readable' ((Read-All "${Drive}:\property-file.env") -eq $content)
-    Stop-Bridge $p
+    Stop-Mount $p
     Check 'drive disappears after stop' (-not (Test-Path "${Drive}:\"))
 
-    $p = Start-Bridge '\secrets\app\prod.env'
+    $p = Start-Mount '\secrets\app\prod.env'
     Check 'root lists the first directory' ((Get-ChildItem "${Drive}:\").Name -eq 'secrets')
     Check 'directory lists the next component' ((Get-ChildItem "${Drive}:\secrets").Name -eq 'app')
     Check 'file is listed in its directory' ((Get-ChildItem "${Drive}:\secrets\app").Name -eq 'prod.env')
@@ -64,15 +64,15 @@ try {
     $wrote = $true
     try { Set-Content "${Drive}:\secrets\app\new.txt" 'x' -ErrorAction Stop } catch { $wrote = $false }
     Check 'writes are refused' (-not $wrote)
-    Stop-Bridge $p
+    Stop-Mount $p
 
-    $p = Start-Bridge 'one/two/f.env'
+    $p = Start-Mount 'one/two/f.env'
     Check 'forward slashes, no leading slash' ((Read-All "${Drive}:\one\two\f.env") -eq $content)
-    Stop-Bridge $p
+    Stop-Mount $p
 }
 finally {
     Stop-Job $server -ErrorAction SilentlyContinue; Remove-Job $server -Force -ErrorAction SilentlyContinue
-    Get-Process winfsp-pipe-bridge -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process pipe-file-mount -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 if ($script:failures) { "$script:failures check(s) failed"; exit 1 }
 'all checks passed'

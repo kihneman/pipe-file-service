@@ -1,6 +1,6 @@
-// FspPipeFileService: a Windows service that shows named pipes as read-only
+// PipeFileService: a Windows service that shows named pipes as read-only
 // files on one WinFsp volume and turns placeholder files into symlinks to
-// them. It is the privileged counterpart of winfsp-pipe-bridge.exe: any local
+// them. It is the privileged counterpart of pipe-file-mount.exe: any local
 // user's app asks it over a control pipe, and only a privileged process may
 // create file symlinks without Developer Mode. The protocol is in the README.
 //
@@ -16,11 +16,11 @@
 #include <sddl.h>
 #include <aclapi.h>
 
-#define SERVICE_VERSION "0.5.0"   // keep equal to BRIDGE_VERSION in winfsp-pipe-bridge.c
-#define SVC_NAME L"FspPipeFileService"
-#define SVC_DISPLAY L"WinFsp Pipe File Service"
-#define CONTROL_PIPE L"\\\\.\\pipe\\FspPipeFileService"
-#define DEFAULT_MOUNT L"C:\\ProgramData\\FspPipeFileService\\mount"
+#define SERVICE_VERSION "0.6.0"   // keep equal to MOUNT_VERSION in pipe-file-mount.c
+#define SVC_NAME L"PipeFileService"
+#define SVC_DISPLAY L"Pipe File Service"
+#define CONTROL_PIPE L"\\\\.\\pipe\\PipeFileService"
+#define DEFAULT_MOUNT L"C:\\ProgramData\\PipeFileService\\mount"
 #define PARAM_KEY L"SYSTEM\\CurrentControlSet\\Services\\" SVC_NAME L"\\Parameters"
 #define PIPE_PREFIX L"\\\\.\\pipe\\"
 #define DENIED_PREFIX "Access denied: you do not have permission"
@@ -1203,8 +1203,8 @@ static void WINAPI svc_main(DWORD argc, LPWSTR *argv)
     (void)argc; (void)argv;
     g_ssh = RegisterServiceCtrlHandlerExW(SVC_NAME, svc_ctrl, NULL);
     if (!g_ssh) return;
-    CreateDirectoryW(L"C:\\ProgramData\\FspPipeFileService", NULL);
-    g_log = _wfopen(L"C:\\ProgramData\\FspPipeFileService\\service.log", L"a");
+    CreateDirectoryW(L"C:\\ProgramData\\PipeFileService", NULL);
+    g_log = _wfopen(L"C:\\ProgramData\\PipeFileService\\service.log", L"a");
     g_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
     WCHAR mount[MAX_PATHW]; read_mount_param(mount, MAX_PATHW);
     read_limit_params();
@@ -1218,13 +1218,50 @@ static void WINAPI svc_main(DWORD argc, LPWSTR *argv)
 
 static BOOL WINAPI on_ctrl(DWORD t) { (void)t; SetEvent(g_stop); return TRUE; }
 
+// Releases before 0.6.0 were called FspPipeFileService. An upgrade must not leave two services (and two
+// volumes) behind, so install removes the old registration, its data folder and, when the old exe has the
+// old file name, that exe and its folder (the folder only if nothing else is in it).
+#define OLD_SVC_NAME L"FspPipeFileService"
+static void remove_legacy_service(SC_HANDLE scm)
+{
+    SC_HANDLE s = OpenServiceW(scm, OLD_SVC_NAME, SERVICE_ALL_ACCESS);
+    WCHAR oldexe[MAX_PATH] = L"";
+    if (s) {
+        DWORD need = 0;
+        QueryServiceConfigW(s, NULL, 0, &need);
+        QUERY_SERVICE_CONFIGW *cfg = need ? (QUERY_SERVICE_CONFIGW *)LocalAlloc(LPTR, need) : NULL;
+        if (cfg && QueryServiceConfigW(s, cfg, need, &need) && cfg->lpBinaryPathName && cfg->lpBinaryPathName[0] == L'"') {
+            const WCHAR *b = cfg->lpBinaryPathName + 1, *e = wcschr(b, L'"');
+            if (e && (size_t)(e - b) < MAX_PATH) wcsncpy_s(oldexe, MAX_PATH, b, (size_t)(e - b));
+        }
+        if (cfg) LocalFree(cfg);
+        SERVICE_STATUS st;
+        ControlService(s, SERVICE_CONTROL_STOP, &st);
+        for (int i = 0; i < 100 && QueryServiceStatus(s, &st) && st.dwCurrentState != SERVICE_STOPPED; i++) Sleep(100);
+        if (DeleteService(s)) wprintf(L"removed the old service %ls\n", OLD_SVC_NAME);
+        else fprintf(stderr, "warning: could not remove the old service %ls: %lu\n", OLD_SVC_NAME, GetLastError());
+        CloseServiceHandle(s);
+    }
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\" OLD_SVC_NAME L"\\Parameters");
+    DeleteFileW(L"C:\\ProgramData\\" OLD_SVC_NAME L"\\service.log");
+    RemoveDirectoryW(L"C:\\ProgramData\\" OLD_SVC_NAME L"\\mount");   // an empty leftover mount folder
+    RemoveDirectoryW(L"C:\\ProgramData\\" OLD_SVC_NAME);               // only if nothing else is in it
+    size_t n = wcslen(oldexe), tail = wcslen(L"\\" OLD_SVC_NAME L".exe");
+    if (n > tail && 0 == _wcsicmp(oldexe + n - tail, L"\\" OLD_SVC_NAME L".exe")) {
+        for (int i = 0; i < 20 && !DeleteFileW(oldexe) && GetFileAttributesW(oldexe) != INVALID_FILE_ATTRIBUTES; i++) Sleep(100);
+        oldexe[n - tail] = 0;
+        RemoveDirectoryW(oldexe);
+    }
+}
+
 static int install(const WCHAR *mount, BOOL auto_start)
 {
     WCHAR exe[MAX_PATH], cmd[MAX_PATH + 16];
     GetModuleFileNameW(NULL, exe, MAX_PATH);
     swprintf_s(cmd, MAX_PATH + 16, L"\"%ls\" service", exe);
-    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (!scm) { fprintf(stderr, "cannot open the service manager (run elevated): %lu\n", GetLastError()); return 1; }
+    remove_legacy_service(scm);
     SC_HANDLE s = CreateServiceW(scm, SVC_NAME, SVC_DISPLAY, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
         auto_start ? SERVICE_AUTO_START : SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, cmd, NULL, NULL, NULL, NULL, NULL);
     if (!s) { fprintf(stderr, "CreateService failed: %lu\n", GetLastError()); CloseServiceHandle(scm); return 1; }
@@ -1262,8 +1299,8 @@ static int uninstall(void)
     BOOL ok = DeleteService(s);
     CloseServiceHandle(s); CloseServiceHandle(scm);
     RegDeleteTreeW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\" SVC_NAME L"\\Parameters");
-    DeleteFileW(L"C:\\ProgramData\\FspPipeFileService\\service.log");
-    RemoveDirectoryW(L"C:\\ProgramData\\FspPipeFileService");   // only if nothing else is in it
+    DeleteFileW(L"C:\\ProgramData\\PipeFileService\\service.log");
+    RemoveDirectoryW(L"C:\\ProgramData\\PipeFileService");   // only if nothing else is in it
     if (!ok) { fprintf(stderr, "DeleteService failed: %lu\n", GetLastError()); return 1; }
     wprintf(L"removed %ls\n", SVC_NAME);
     return 0;
@@ -1272,7 +1309,7 @@ static int uninstall(void)
 static int usage(void)
 {
     fwprintf(stderr,
-        L"usage: FspPipeFileService <command>\n"
+        L"usage: PipeFileService <command>\n"
         L"  install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [limits]   (elevated)\n"
         L"  uninstall                                                           (elevated)\n"
         L"  run [--mount <...>] [--winfsp-dir <folder>] [limits]   run in this console (elevated), for development;\n"
@@ -1304,7 +1341,7 @@ static BOOL parse_limit_arg(const wchar_t *flag, const wchar_t *text)
 int wmain(int argc, wchar_t **argv)
 {
     if (argc == 2 && (0 == wcscmp(argv[1], L"--version") || 0 == wcscmp(argv[1], L"-V"))) {
-        printf("FspPipeFileService %s\n", SERVICE_VERSION);
+        printf("PipeFileService %s\n", SERVICE_VERSION);
         return 0;
     }
     if (argc < 2) return usage();

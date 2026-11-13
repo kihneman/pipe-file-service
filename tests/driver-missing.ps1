@@ -1,4 +1,4 @@
-# Tests how FspPipeFileService behaves when WinFsp is missing, without needing a machine that lacks WinFsp:
+# Tests how PipeFileService behaves when WinFsp is missing, without needing a machine that lacks WinFsp:
 # `run --winfsp-dir <folder>` (a development switch that only exists in run mode) makes the WinFsp check look
 # for <folder>\bin\winfsp-x64.dll instead of the real install.
 #
@@ -7,7 +7,7 @@
 #   present at start-up   the control pipe exists and registration works    real WinFsp: it really mounts a volume)
 #
 # Run it from Windows PowerShell 5.1. -Exe selects the binary (the mutation check passes a broken build).
-param([string]$Exe = (Join-Path $PSScriptRoot '..\FspPipeFileService.exe'))
+param([string]$Exe = (Join-Path $PSScriptRoot '..\PipeFileService.exe'))
 $ErrorActionPreference = 'Stop'
 $Exe = [IO.Path]::GetFullPath($Exe)
 $work = Join-Path $env:TEMP "fsp-driver-missing-$PID"
@@ -18,10 +18,10 @@ function Check($name, $ok, $detail) {
     if ($ok) { "PASS  $name" } else { "FAIL  $name   $detail"; $script:failures++ }
 }
 $elevated = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole('Administrators')
-$pipePath = '\\.\pipe\FspPipeFileService'
+$pipePath = '\\.\pipe\PipeFileService'
 # A real service already running owns the control pipe: then "no pipe" cannot be judged and the elevated part would collide.
 $busy = Test-Path $pipePath
-if ($busy) { 'NOTE  a FspPipeFileService is already running (the control pipe exists): skipping the checks that need the pipe to be free' }
+if ($busy) { 'NOTE  a PipeFileService is already running (the control pipe exists): skipping the checks that need the pipe to be free' }
 
 function Start-Svc($mount, $winfspDir) {
     $a = @('run', '--mount', "`"$mount`"")
@@ -43,7 +43,7 @@ function Stop-Svc($p) {
     if (-not $p.Proc.HasExited) { Stop-Process -Id $p.Proc.Id -Force; $p.Proc.WaitForExit(5000) | Out-Null }
 }
 function New-Client {
-    $c = New-Object IO.Pipes.NamedPipeClientStream('.', 'FspPipeFileService', 'InOut')
+    $c = New-Object IO.Pipes.NamedPipeClientStream('.', 'PipeFileService', 'InOut')
     $c.Connect(5000); $c.ReadMode = 'Message'
     $c
 }
@@ -83,7 +83,7 @@ $ErrorActionPreference = 'Stop'
 
 # ---- 3 and 4 need the real WinFsp and an elevated shell
 if ($busy -or -not $elevated) {
-    'SKIP  present-at-start and gone-at-register: need an elevated shell and no running FspPipeFileService'
+    'SKIP  present-at-start and gone-at-register: need an elevated shell and no running PipeFileService'
 } else {
     New-Item -ItemType Directory (Join-Path $fake 'bin') -Force | Out-Null
     $dummy = Join-Path $fake 'bin\winfsp-x64.dll'

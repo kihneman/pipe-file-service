@@ -1,9 +1,9 @@
-# Checks that the bridge fetches the content on the first Read of a handle, not at
+# Checks that the mount tool fetches the content on the first Read of a handle, not at
 # Open: programs that open the file and close it never reach the data server. Uses a
-# counting fake server (count-server.ps1). Needs WinFsp installed and the bridge
+# counting fake server (count-server.ps1). Needs WinFsp installed and the mount tool
 # built; use a free drive letter. Windows PowerShell 5.1 or later.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\winfsp-pipe-bridge.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\pipe-file-mount.exe'),
     [string]$Drive = 'K'
 )
 $ErrorActionPreference = 'Stop'
@@ -70,7 +70,7 @@ public static class RawFile {
 '@
 
 $servers = @()
-$bridges = @()
+$mounts = @()
 function Start-Server($pipe, $log, $mode, $delay) {
     $a = @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'count-server.ps1'), '-Pipe', $pipe, '-Log', $log, '-Mode', $mode, '-DelayMs', $delay)
     $p = Start-Process powershell -ArgumentList $a -PassThru -WindowStyle Hidden
@@ -78,25 +78,25 @@ function Start-Server($pipe, $log, $mode, $delay) {
     Start-Sleep -Milliseconds 1500
     $p
 }
-function Start-Bridge($pipe, $extra) {
+function Start-Mount($pipe, $extra) {
     $a = @("\\.\pipe\$pipe", "${Drive}:", '\app.env') + $extra
     $p = Start-Process -FilePath $Exe -ArgumentList $a -PassThru -WindowStyle Hidden
-    $script:bridges += $p
+    $script:mounts += $p
     Start-Sleep -Seconds 3
     $p
 }
-function Stop-All($bridge, $server) {
-    Stop-Process -Id $bridge.Id -Force -ErrorAction SilentlyContinue
+function Stop-All($mount, $server) {
+    Stop-Process -Id $mount.Id -Force -ErrorAction SilentlyContinue
     Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
 }
 
 try {
-    # ---- direct mode: the bridge reads the data pipe itself
+    # ---- direct mode: the mount tool reads the data pipe itself
     $pipe = "lazy-direct-$PID"; $log = Join-Path $work 'direct.log'
     $srv = Start-Server $pipe $log 'direct' 0
-    $br = Start-Bridge $pipe @()
-    Check 'bridge is up' (Test-Path "${Drive}:\") 'drive missing'
+    $br = Start-Mount $pipe @()
+    Check 'mount tool is up' (Test-Path "${Drive}:\") 'drive missing'
 
     $null = Get-ChildItem "${Drive}:\"; $null = Test-Path $file
     $null = [IO.File]::GetAttributes($file); $null = (New-Object IO.FileInfo $file).Length
@@ -118,7 +118,7 @@ try {
     $log = Join-Path $work 'direct-slow.log'
     $pipe = "lazy-slow-$PID"
     $srv = Start-Server $pipe $log 'direct' 1500
-    $br = Start-Bridge $pipe @()
+    $br = Start-Mount $pipe @()
     $r = [RawFile]::TwoConcurrentReads($file)
     Check 'two concurrent first reads both succeed' (($r[0] -eq 2) -and ($r[1] -eq 2)) "got $($r -join ',')"
     Check 'two concurrent first reads cause one connection' ((Count $log 'conn') -eq 1) "conns=$(Count $log 'conn')"
@@ -127,7 +127,7 @@ try {
     # ---- reader-info mode
     $pipe = "lazy-info-$PID"; $log = Join-Path $work 'info.log'
     $srv = Start-Server "$pipe-reader" $log 'allow' 0
-    $br = Start-Bridge $pipe @('--reader-info-suffix', '-reader')
+    $br = Start-Mount $pipe @('--reader-info-suffix', '-reader')
     $null = Get-ChildItem "${Drive}:\"; $null = [IO.File]::GetAttributes($file)
     $n = [RawFile]::OpenRead($file, 0)
     Check 'reader-info: open and close without reading sends no request' (($n -eq 0) -and ((Count $log 'req') -eq 0)) "n=$n reqs=$(Count $log 'req')"
@@ -144,22 +144,22 @@ try {
     # ---- denied reader: first Read fails, later reads do not ask again
     $log = Join-Path $work 'deny.log'
     $srv = Start-Server "$pipe-reader" $log 'deny' 0
-    $br = Start-Bridge $pipe @('--reader-info-suffix', '-reader')
+    $br = Start-Mount $pipe @('--reader-info-suffix', '-reader')
     $n = [RawFile]::OpenRead($file, 3)
     Check 'denied reader: the read fails' ($n -eq -1) "n=$n"
     Check 'denied reader: repeated reads on one handle ask the server once' ((Count $log 'req') -eq 1) "reqs=$(Count $log 'req')"
     Stop-All $br $srv
 
     # ---- server down: the first Read fails cleanly
-    $br = Start-Bridge $pipe @('--reader-info-suffix', '-reader')
+    $br = Start-Mount $pipe @('--reader-info-suffix', '-reader')
     $n = [RawFile]::OpenRead($file, 1)
     Check 'server down: open succeeds but the first read fails cleanly' ($n -eq -1) "n=$n"
-    Check 'server down: the bridge is still running' (-not $br.HasExited)
+    Check 'server down: the mount tool is still running' (-not $br.HasExited)
     Stop-Process -Id $br.Id -Force -ErrorAction SilentlyContinue
 }
 finally {
     foreach ($s in $servers) { Stop-Process -Id $s.Id -Force -ErrorAction SilentlyContinue }
-    foreach ($b in $bridges) { Stop-Process -Id $b.Id -Force -ErrorAction SilentlyContinue }   # only the ones started here
+    foreach ($b in $mounts) { Stop-Process -Id $b.Id -Force -ErrorAction SilentlyContinue }   # only the ones started here
     Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($script:failures) { "$script:failures check(s) failed"; exit 1 }

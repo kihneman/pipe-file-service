@@ -1,5 +1,5 @@
 # A fake data server for lazy-fetch.ps1. It records every connection it gets, so the
-# test can count how often the bridge reaches the server.
+# test can count how often the mount tool reaches the server.
 #   -Mode direct   serves the content on every connection to -Pipe
 #   -Mode allow    serves the reader-info protocol on -Pipe: reads the request, logs the
 #                  reader pid, answers ok and then streams the content
