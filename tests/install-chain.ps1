@@ -1,4 +1,4 @@
-# End-to-end check of installing FspPipeFileService BEFORE WinFsp, for a CLEAN VM (Windows 10/11 x64).
+# End-to-end check of installing PipeFileService BEFORE WinFsp, for a CLEAN VM (Windows 10/11 x64).
 # Run in an ELEVATED Windows PowerShell 5.1, with someone logged on interactively (the smoke test is run as
 # that user through a scheduled task, unelevated, which is the realistic caller).
 #
@@ -10,9 +10,9 @@
 #   3. Stop the service, uninstall WinFsp, `sc start` again: it must stop cleanly again.
 #   4. Uninstall the service and check nothing is left.
 #
-# Copy this repository's FspPipeFileService.exe, tests\ and the WinFsp MSI (see -WinFspMsi) to the VM.
+# Copy this repository's PipeFileService.exe, tests\ and the WinFsp MSI (see -WinFspMsi) to the VM.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\FspPipeFileService.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\PipeFileService.exe'),
     [Parameter(Mandatory)] [string]$WinFspMsi,
     # The MSI this procedure was written and verified against (winfsp-2.1.25156.msi). A different file is refused unless
     # you pass its own hash, so the script never installs something nobody pinned.
@@ -31,13 +31,13 @@ $script:failures = 0
 function Check($name, $ok, $detail) {
     if ($ok) { "PASS  $name" } else { "FAIL  $name   $detail"; $script:failures++ }
 }
-$svc = 'FspPipeFileService'
+$svc = 'PipeFileService'
 $pipePath = "\\.\pipe\$svc"
 $scmIds = 7000, 7023, 7024, 7031, 7032, 7034
 
 function Get-ScmFailures($since) {
     $ev = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = $scmIds; StartTime = $since } -ErrorAction SilentlyContinue
-    @($ev | Where-Object { $_.Message -match 'FspPipeFileService|WinFsp Pipe File Service' })
+    @($ev | Where-Object { $_.Message -match 'PipeFileService|Pipe File Service' })
 }
 function Get-ExitCodes($name) {
     $q = & sc.exe query $name | Out-String
@@ -99,7 +99,7 @@ try {
     Check 'exit code is 0 (not a service error)' ($ec.Win32 -eq '0' -and $ec.Specific -eq '0') ($ec | Out-String)
     Check 'no control pipe' (-not (Test-Path $pipePath)) 'the pipe exists'
     Check 'no process left' (-not (Get-Process $svc -ErrorAction SilentlyContinue)) 'process still running'
-    $svcLog = 'C:\ProgramData\FspPipeFileService\service.log'
+    $svcLog = 'C:\ProgramData\PipeFileService\service.log'
     Check 'service.log says WinFsp is not installed (once)' (@(Select-String -Path $svcLog -Pattern 'WinFsp is not installed').Count -eq 1) ((Get-Content $svcLog -ErrorAction SilentlyContinue) -join "`n")
     Start-Sleep -Seconds 3
     $bad = Get-ScmFailures $t0
@@ -161,12 +161,12 @@ try {
     & $Exe uninstall
     Start-Sleep -Seconds 1
     Check 'service removed' (-not (Get-Service $svc -ErrorAction SilentlyContinue)) ''
-    Check 'data folder removed' (-not (Test-Path 'C:\ProgramData\FspPipeFileService')) ''
+    Check 'data folder removed' (-not (Test-Path 'C:\ProgramData\PipeFileService')) ''
     Check 'no process left' (-not (Get-Process $svc -ErrorAction SilentlyContinue)) ''
 }
 catch { "ERROR  $($_.Exception.Message)"; $script:failures++ }
 finally {
-    "Event log (System, Service Control Manager, this run, FspPipeFileService only):"
+    "Event log (System, Service Control Manager, this run, PipeFileService only):"
     if ($t0) { Get-ScmFailures $t0 | ForEach-Object { "  $($_.TimeCreated) $($_.Id) $($_.Message)" } }
     if ($script:failures) { "$($script:failures) FAILED" } else { 'ALL PASSED' }
     "Logs are in $LogDir"

@@ -13,8 +13,8 @@ $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $Out = [IO.Path]::GetFullPath($Out)
 
 # The single source of the version is the #define in the C file.
-$source = Get-Content (Join-Path $root 'src\winfsp-pipe-bridge.c') -Raw
-if ($source -notmatch '#define BRIDGE_VERSION "([^"]+)"') { throw 'BRIDGE_VERSION not found in the source.' }
+$source = Get-Content (Join-Path $root 'src\pipe-file-mount.c') -Raw
+if ($source -notmatch '#define MOUNT_VERSION "([^"]+)"') { throw 'MOUNT_VERSION not found in the source.' }
 $version = $Matches[1]
 
 $releaseVersion = $version
@@ -26,16 +26,16 @@ if ($Tag) {
 }
 
 & (Join-Path $root 'build.ps1') -WinFsp $WinFsp
-$exe = Join-Path $root 'winfsp-pipe-bridge.exe'
+$exe = Join-Path $root 'pipe-file-mount.exe'
 $reported = (& $exe --version)
-if ($reported -ne "winfsp-pipe-bridge $version") { throw "The built binary reports '$reported', expected 'winfsp-pipe-bridge $version'." }
-$svcExe = Join-Path $root 'FspPipeFileService.exe'
+if ($reported -ne "pipe-file-mount $version") { throw "The built binary reports '$reported', expected 'pipe-file-mount $version'." }
+$svcExe = Join-Path $root 'PipeFileService.exe'
 $reported = (& $svcExe --version)
-if ($reported -ne "FspPipeFileService $version") { throw "The built service reports '$reported', expected 'FspPipeFileService $version'." }
+if ($reported -ne "PipeFileService $version") { throw "The built service reports '$reported', expected 'PipeFileService $version'." }
 
 if (Test-Path $Out) { Remove-Item $Out -Recurse -Force }
 New-Item -ItemType Directory $Out | Out-Null
-$name = "winfsp-pipe-bridge-$releaseVersion-windows-x64"
+$name = "pipe-file-mount-$releaseVersion-windows-x64"
 $stage = Join-Path $Out $name
 New-Item -ItemType Directory $stage | Out-Null
 Copy-Item $exe, $svcExe, (Join-Path $root 'LICENSE'), (Join-Path $root 'README.md') $stage
@@ -49,10 +49,10 @@ $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText((Join-Path $Out 'SHA256SUMS'), "$hash  $name.zip`n", (New-Object Text.UTF8Encoding($false)))
 
 $notes = @"
-winfsp-pipe-bridge $releaseVersion (experimental, Windows x64)
+pipe-file-mount $releaseVersion (experimental, Windows x64)
 
 Exposes a Windows named pipe as a read-only file on a WinFsp volume.
-``winfsp-pipe-bridge.exe`` does it for one pipe in one process; ``FspPipeFileService.exe`` is a
+``pipe-file-mount.exe`` does it for one pipe in one process; ``PipeFileService.exe`` is a
 Windows service that does it for any local user's app and can link placeholder files to the
 pipes (see the README).
 
@@ -69,7 +69,7 @@ The files carry a signed GitHub build attestation (built by this repository's re
 workflow from this tag). Verify it with the GitHub CLI:
 
 ``````
-gh attestation verify $name.zip -R kihneman/winfsp-pipe-bridge
+gh attestation verify $name.zip -R kihneman/pipe-file-service
 ``````
 
 > WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos

@@ -1,4 +1,4 @@
-# Smoke test for FspPipeFileService. The service must already be running
+# Smoke test for PipeFileService. The service must already be running
 # (tests\service-up.ps1, elevated). Run this from an ordinary, unelevated Windows
 # PowerShell 5.1: that is the realistic caller and the one that exercises the
 # owner and impersonation checks. -LeaveLinked leaves one linked registration open
@@ -18,7 +18,7 @@ function Check($name, $ok, $detail) {
 
 # ---- control pipe client
 function New-Client {
-    $c = New-Object IO.Pipes.NamedPipeClientStream('.', 'FspPipeFileService', 'InOut')
+    $c = New-Object IO.Pipes.NamedPipeClientStream('.', 'PipeFileService', 'InOut')
     $c.Connect(5000); $c.ReadMode = 'Message'
     $c
 }
@@ -231,7 +231,7 @@ try {
         $lp = Join-Path $leftDir 'left.env'; New-Item $lp -ItemType File -Force | Out-Null
         $script = Join-Path $leftDir 'hold.ps1'
         @"
-`$c = New-Object IO.Pipes.NamedPipeClientStream('.', 'FspPipeFileService', 'InOut'); `$c.Connect(5000); `$c.ReadMode = 'Message'
+`$c = New-Object IO.Pipes.NamedPipeClientStream('.', 'PipeFileService', 'InOut'); `$c.Connect(5000); `$c.ReadMode = 'Message'
 `$b = [Text.Encoding]::UTF8.GetBytes((@{ type = 'register'; pipe = '\\.\pipe\$base-l'; file_name = 'left.env'; link_path = '$lp' } | ConvertTo-Json -Compress))
 `$c.Write(`$b, 0, `$b.Length); `$buf = New-Object byte[] 4096; `$null = `$c.Read(`$buf, 0, 4096)
 Start-Sleep -Seconds 600

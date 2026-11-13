@@ -1,4 +1,8 @@
-# winfsp-pipe-bridge
+# pipe-file-service
+
+> Formerly `winfsp-pipe-bridge` (programs `winfsp-pipe-bridge.exe` and `FspPipeFileService.exe`, service
+> `FspPipeFileService`). They are now `pipe-file-mount.exe` and `PipeFileService.exe`; `PipeFileService.exe install`
+> removes a service still registered under the old name.
 
 **Experimental spike.** Exposes a Windows named pipe as a read-only file on a
 [WinFsp](https://github.com/winfsp/winfsp) volume, so tools that only know how
@@ -16,7 +20,7 @@ server: it reads the pipe as an ordinary byte stream, or, with
 ## How it works
 
 ```
-winfsp-pipe-bridge.exe \\.\pipe\<name> <mountpoint> [path on the volume]
+pipe-file-mount.exe \\.\pipe\<name> <mountpoint> [path on the volume]
 ```
 
 Mounts drive `K:` (or `*` to pick a free letter) containing one file. The file
@@ -24,7 +28,7 @@ is at `\property-file.env` unless you give a path, which may have any number of
 directories before the file name:
 
 ```
-winfsp-pipe-bridge.exe \\.\pipe\secrets K: \secrets\app\prod.env
+pipe-file-mount.exe \\.\pipe\secrets K: \secrets\app\prod.env
 ```
 
 serves `K:\secrets\app\prod.env`. The directories (`secrets`, `app`) exist only
@@ -41,54 +45,54 @@ show or stat the file do not reach the server. If the pipe's server answers with
 its standard "Access denied" text the first read fails with
 `STATUS_ACCESS_DENIED`, and later reads on that handle repeat the failure without
 asking again. Two reads racing on a fresh handle share one fetch. For every open
-the bridge logs the caller's PID and executable path, which WinFsp reports at open
+the mount tool logs the caller's PID and executable path, which WinFsp reports at open
 time.
 
 ### Telling the server who opened the file (`--reader-info-suffix`)
 
 By default the pipe's server sees this program as the reader, because it is the
 pipe's client. A server that wants to know (and ask the user about) the program
-that actually opened the file can serve a second pipe, and you point the bridge
+that actually opened the file can serve a second pipe, and you point the mount tool
 at it with a suffix:
 
 ```
-winfsp-pipe-bridge.exe \\.\pipe\secrets K: \secrets\app\prod.env --reader-info-suffix -reader
+pipe-file-mount.exe \\.\pipe\secrets K: \secrets\app\prod.env --reader-info-suffix -reader
 ```
 
-The bridge then opens `\\.\pipe\secrets-reader` (the pipe name plus the suffix),
+The mount tool then opens `\\.\pipe\secrets-reader` (the pipe name plus the suffix),
 and on the first read of every handle opened for data it sends the caller's PID
-and process creation time. WinFsp reports the caller only in `Open`, so the bridge
+and process creation time. WinFsp reports the caller only in `Open`, so the mount tool
 records them there (and keeps a handle on the process so the PID cannot be
 reused) and sends them at the first read. The server answers for that caller.
 This is a request, not a hint: if the second pipe is missing or the server
 refuses, the first read fails (`STATUS_ACCESS_DENIED` when refused,
-`STATUS_IO_DEVICE_ERROR` when the server cannot be used). The bridge never falls back to the data pipe,
-because that would make the bridge the reader.
+`STATUS_IO_DEVICE_ERROR` when the server cannot be used). The mount tool never falls back to the data pipe,
+because that would make the mount tool the reader.
 
 Protocol, version 1. Every message is a frame: a 4-byte big-endian body length,
 one tag byte, then a JSON body.
 
 | Direction | Tag | Body |
 |---|---|---|
-| bridge to server | 72 | `{"protocol":1,"reader_pid":<u32>,"reader_start_time":<u64>}` (start time is the process creation FILETIME) |
-| server to bridge | 73 | `{"status":"ok"}` or `{"status":"denied"}` |
+| mount tool to server | 72 | `{"protocol":1,"reader_pid":<u32>,"reader_start_time":<u64>}` (start time is the process creation FILETIME) |
+| server to mount tool | 73 | `{"status":"ok"}` or `{"status":"denied"}` |
 
 After an `ok` response the server writes the content as raw bytes, unframed, and
 closes the pipe. After `denied`, or if the server closes the pipe without a
 response, the open fails with access denied. The server should verify the
 caller itself (the PID is still alive and was created at the stated time) and
-decide whether to trust the bridge; the bridge only reports what WinFsp told it.
+decide whether to trust the mount tool; the mount tool only reports what WinFsp told it.
 
-A server should only believe the caller information from a bridge it
+A server should only believe the caller information from a mount tool it
 recognises, for example by looking up the pipe client's process and checking the
-SHA-256 of its executable (`Get-FileHash winfsp-pipe-bridge.exe`) against a list
-it trusts. The bridge is not signed, so such a list can only pin this exact
-file: a rebuilt or updated bridge has a new hash and has to be trusted again.
+SHA-256 of its executable (`Get-FileHash pipe-file-mount.exe`) against a list
+it trusts. The mount tool is not signed, so such a list can only pin this exact
+file: a rebuilt or updated mount tool has a new hash and has to be trusted again.
 
-## FspPipeFileService
+## PipeFileService
 
 A Windows service for apps that cannot start a program of their own, or that need a
-file *link*. It is the privileged counterpart of `winfsp-pipe-bridge.exe`: one
+file *link*. It is the privileged counterpart of `pipe-file-mount.exe`: one
 long-running service, on one WinFsp volume, that any local user's app can ask to
 
 1. show a named pipe as a read-only file (the **data server** is whatever serves the pipe), and
@@ -96,18 +100,18 @@ long-running service, on one WinFsp volume, that any local user's app can ask to
    privileged process may create file symlinks without Developer Mode.
 
 ```
-FspPipeFileService.exe install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [limits]   (elevated)
-FspPipeFileService.exe uninstall                                                                                  (elevated)
-FspPipeFileService.exe run [--mount <...>] [--winfsp-dir <folder>] [limits]    run in this console (elevated), for development
+PipeFileService.exe install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [limits]   (elevated)
+PipeFileService.exe uninstall                                                                                  (elevated)
+PipeFileService.exe run [--mount <...>] [--winfsp-dir <folder>] [limits]    run in this console (elevated), for development
 ```
 
-The default mount is `C:\ProgramData\FspPipeFileService\mount` (a WinFsp mount
+The default mount is `C:\ProgramData\PipeFileService\mount` (a WinFsp mount
 folder must not exist; the service creates the parent and removes an empty
-leftover). The service is `FspPipeFileService`, display name "WinFsp Pipe File
+leftover). The service is `PipeFileService`, display name "Pipe File
 Service", runs as LocalSystem with a minimal privilege list
 (`SeCreateSymbolicLinkPrivilege`, `SeImpersonatePrivilege`, `SeChangeNotifyPrivilege`)
 and is started on demand, or at every boot with `install --auto-start`. It writes
-`C:\ProgramData\FspPipeFileService\service.log`.
+`C:\ProgramData\PipeFileService\service.log`.
 
 ### The volume
 
@@ -145,7 +149,7 @@ without asking the server again.
 
 ### Control pipe
 
-`\\.\pipe\FspPipeFileService`: message mode, local clients only, writable by
+`\\.\pipe\PipeFileService`: message mode, local clients only, writable by
 interactive users. One JSON object per message, flat (no nesting). Identity is
 always taken from the connection (`ImpersonateNamedPipeClient`), never from a field.
 A connection sees and changes only its own registrations. **When the connection
@@ -228,7 +232,7 @@ later, only if the user agrees):
   nothing listens while WinFsp is missing: **the control pipe does not exist until
   WinFsp is installed and the service is started.**
 - **After installing WinFsp:** start the service again with an elevated
-  `sc start FspPipeFileService` (or reboot). There is no wake-up message.
+  `sc start PipeFileService` (or reboot). There is no wake-up message.
 - **WinFsp removed while the service runs:** `register` answers
   `driver_not_installed` and registers nothing. Registrations that already exist
   are left alone; they stop working by themselves (reads fail) and are cleaned up
@@ -263,7 +267,7 @@ apart), and an older one is upgraded in place.
 
 Afterwards, check: `HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir` exists with
 `bin\winfsp-x64.dll` in it, a `WinFsp+...` file system driver service is registered (`sc query type= driver state= all`), and the
-`WinFsp.Launcher` service is running. Then `sc start FspPipeFileService`.
+`WinFsp.Launcher` service is running. Then `sc start PipeFileService`.
 
 Uninstall (the product code changes with every WinFsp version; find it from the
 upgrade code `{5466A3D8-3AA1-4240-B6A0-3A051940A3EC}`):
@@ -311,13 +315,13 @@ and the WinFsp SDK (headers and import library):
 extracts it without installing anything. The result links the C runtime
 statically (no Visual C++ redistributable) and loads `winfsp-x64.dll` at run
 time from the installed WinFsp, printing "WinFsp is not installed" if it is
-missing. `winfsp-pipe-bridge.exe --version` works without WinFsp. The same script builds
-`FspPipeFileService.exe`.
+missing. `pipe-file-mount.exe --version` works without WinFsp. The same script builds
+`PipeFileService.exe`.
 
 ## Releases
 
 Releases are built by GitHub Actions when a tag is pushed. The tag must match
-`BRIDGE_VERSION` in `src\winfsp-pipe-bridge.c`: `v0.1.0` for a release,
+`MOUNT_VERSION` in `src\pipe-file-mount.c`: `v0.1.0` for a release,
 `v0.1.0-rc.1` (any `-suffix`) for a pre-release.
 
 ```powershell
@@ -337,7 +341,7 @@ which proves they were built by this repository's release workflow from the
 tagged commit (releases before v0.1.2 have none):
 
 ```
-gh attestation verify winfsp-pipe-bridge-<version>-windows-x64.zip -R kihneman/winfsp-pipe-bridge
+gh attestation verify pipe-file-mount-<version>-windows-x64.zip -R kihneman/pipe-file-service
 sha256sum -c SHA256SUMS
 ```
 
@@ -345,7 +349,7 @@ sha256sum -c SHA256SUMS
 
 `tests\smoke.ps1` serves a pipe from the script itself, mounts it, and checks
 reads, nested and default paths, case-insensitive lookup, rejected paths, refused
-writes and unmount. It needs WinFsp, a built `winfsp-pipe-bridge.exe` and a free
+writes and unmount. It needs WinFsp, a built `pipe-file-mount.exe` and a free
 drive letter (default `K`):
 
 ```powershell
@@ -363,7 +367,7 @@ drive letter (default `K`):
   read open) and close without reading. Fetching at the first read keeps those
   away from the server. WinFsp still delivers reads when the reported size is 0,
   so real readers get their data.
-- Measured with a counting server (Windows 11, bridge on a drive letter): a
+- Measured with a counting server (Windows 11, mount tool on a drive letter): a
   directory listing (`Get-ChildItem`, `dir`), `Get-Item`, `Test-Path`,
   `FileInfo.Length`, `File.Exists`, `icacls`, `attrib`, a read-open that closes
   without reading, and `Copy-Item` (CopyFile) cause no fetch. Reading programs
@@ -383,7 +387,7 @@ drive letter (default `K`):
 - `FileSystemName` holds 16 wide characters including the terminator; a longer
   name makes the CRT fast-fail (`0xC0000409`) with no message.
 - The volume's security descriptor allows only the current user and SYSTEM, so
-  other users cannot trigger reads through the bridge.
+  other users cannot trigger reads through the mount tool.
 
 ## Not done
 

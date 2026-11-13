@@ -1,4 +1,4 @@
-// winfsp-pipe-bridge (experimental): expose one read-only file on a WinFsp
+// pipe-file-mount (experimental): expose one read-only file on a WinFsp
 // volume whose content is read from a Windows named pipe each time the file is
 // opened for reading. Nothing is written to disk. The file can sit at any path
 // on the volume; the directories above it are virtual and read-only. The
@@ -15,7 +15,7 @@
 #include <stdarg.h>
 #include <sddl.h>
 
-#define BRIDGE_VERSION "0.5.0"   // scripts/release.ps1 reads this; release tags must match it
+#define MOUNT_VERSION "0.6.0"   // scripts/release.ps1 reads this; release tags must match it
 #define DEFAULT_PATH L"\\property-file.env"
 #define DENIED_PREFIX "Access denied: you do not have permission"
 #define MAX_DEPTH 32
@@ -113,7 +113,7 @@ static void caller(char *out, size_t n)
 }
 
 // Reader info (--reader-info-suffix <suffix>). With the option, the content is
-// not read from the data pipe directly: the bridge opens a second pipe named
+// not read from the data pipe directly: the mount tool opens a second pipe named
 // <data pipe><suffix>, sends the PID and creation time of the program that
 // opened the file, and the server answers for that program (it can ask the user
 // about it, refuse it, or serve it). The protocol is described in the README.
@@ -280,7 +280,7 @@ static void fill_info(const Ctx *c, FSP_FSCTL_FILE_INFO *fi)
     fi->IndexNumber = (UINT64)c->depth + 1;
 }
 
-// Only the user who started the bridge (and SYSTEM) may open anything on the
+// Only the user who started the mount tool (and SYSTEM) may open anything on the
 // volume: it is a front door to a pipe that only this user may read.
 static PSECURITY_DESCRIPTOR g_sd;
 static SIZE_T g_sdsz;
@@ -304,8 +304,8 @@ static NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM *fs, FSP_FSCTL_VOLUME_INFO *vi)
 {
     (void)fs;
     vi->TotalSize = 1 << 20; vi->FreeSize = 0;
-    vi->VolumeLabelLength = (UINT16)(sizeof(L"PipeBridge") - sizeof(WCHAR));
-    memcpy(vi->VolumeLabel, L"PipeBridge", vi->VolumeLabelLength);
+    vi->VolumeLabelLength = (UINT16)(sizeof(L"PipeFile") - sizeof(WCHAR));
+    memcpy(vi->VolumeLabel, L"PipeFile", vi->VolumeLabelLength);
     return STATUS_SUCCESS;
 }
 
@@ -455,7 +455,7 @@ static BOOL WINAPI on_ctrl(DWORD t) { (void)t; SetEvent(g_stop); return TRUE; }
 int wmain(int argc, wchar_t **argv)
 {
     if (argc == 2 && (0 == wcscmp(argv[1], L"--version") || 0 == wcscmp(argv[1], L"-V"))) {
-        printf("winfsp-pipe-bridge %s\n", BRIDGE_VERSION);
+        printf("pipe-file-mount %s\n", MOUNT_VERSION);
         return 0;
     }
     const wchar_t *suffix = NULL;
@@ -469,7 +469,7 @@ int wmain(int argc, wchar_t **argv)
     }
     if (bad_option || argc < 3 || argc > 4) {
         fwprintf(stderr,
-            L"usage: winfsp-pipe-bridge <\\\\.\\pipe\\name> <mountpoint: K: or *> [path on the volume] [--reader-info-suffix <suffix>]\n"
+            L"usage: pipe-file-mount <\\\\.\\pipe\\name> <mountpoint: K: or *> [path on the volume] [--reader-info-suffix <suffix>]\n"
             L"  --reader-info-suffix: do not read the pipe directly; open <pipe name><suffix>, tell the server which\n"
             L"  program opened the file (PID and start time) and read the content it serves for that program\n"
             L"  path defaults to %ls; directories above the file are created virtually,\n"
@@ -504,7 +504,7 @@ int wmain(int argc, wchar_t **argv)
     vp.CasePreservedNames = 1; vp.UnicodeOnDisk = 1; vp.PersistentAcls = 1;
     vp.FlushAndPurgeOnCleanup = 1;   // drop cached data when the last handle closes
     vp.UmFileContextIsUserContext2 = 1; vp.PostCleanupWhenModifiedOnly = 1;
-    wcscpy_s(vp.FileSystemName, sizeof vp.FileSystemName / sizeof(WCHAR), L"PipeBridge"); // at most 15 characters: the field holds 16 wide chars including the NUL
+    wcscpy_s(vp.FileSystemName, sizeof vp.FileSystemName / sizeof(WCHAR), L"PipeFile"); // at most 15 characters: the field holds 16 wide chars including the NUL
 
     FSP_FILE_SYSTEM *fs = NULL;
     NTSTATUS st = FspFileSystemCreate(L"" FSP_FSCTL_DISK_DEVICE_NAME, &vp, &g_iface, &fs);

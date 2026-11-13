@@ -1,4 +1,4 @@
-# Builds winfsp-pipe-bridge.exe (x64) with the MSVC compiler. Finds Visual
+# Builds pipe-file-mount.exe (x64) with the MSVC compiler. Finds Visual
 # Studio's C++ tools itself, so it works from a plain PowerShell.
 # -WinFsp must point at a folder containing inc\winfsp\winfsp.h and
 # lib\winfsp-x64.lib: an installed WinFsp (with the Developer feature) or the
@@ -25,10 +25,10 @@ Set-Location $PSScriptRoot
 New-Item -ItemType Directory -Force build | Out-Null
 # /MT: no Visual C++ redistributable needed. winfsp-x64.dll is delay-loaded so
 # the program can say "install WinFsp" instead of failing in the loader.
-cl /nologo /W3 /std:c11 /MT /Fo:build\ /Fe:winfsp-pipe-bridge.exe src\winfsp-pipe-bridge.c `
+cl /nologo /W3 /std:c11 /MT /Fo:build\ /Fe:pipe-file-mount.exe src\pipe-file-mount.c `
     /I"$WinFsp\inc" /link "$WinFsp\lib\winfsp-x64.lib" advapi32.lib delayimp.lib /DELAYLOAD:winfsp-x64.dll
 if ($LASTEXITCODE -ne 0) { throw "cl.exe failed with exit code $LASTEXITCODE" }
 
-cl /nologo /W3 /std:c11 /MT /Fo:build\ /Fe:FspPipeFileService.exe src\FspPipeFileService.c `
+cl /nologo /W3 /std:c11 /MT /Fo:build\ /Fe:PipeFileService.exe src\PipeFileService.c `
     /I"$WinFsp\inc" /link "$WinFsp\lib\winfsp-x64.lib" advapi32.lib delayimp.lib /DELAYLOAD:winfsp-x64.dll
 if ($LASTEXITCODE -ne 0) { throw "cl.exe failed with exit code $LASTEXITCODE" }

@@ -1,9 +1,9 @@
 # Checks the limits on the control pipe: registrations per connection, registrations per user and connections
 # per user. (The limit on connections in total needs several accounts and is not covered.)
-# The service must already be running (tests\service-up.ps1, or `FspPipeFileService.exe run` in an
+# The service must already be running (tests\service-up.ps1, or `PipeFileService.exe run` in an
 # elevated console). Run this from an ordinary, unelevated Windows PowerShell 5.1.
 # The parameters must equal the service's limits. The defaults are 64, 256 and 16; a quicker run is
-#   FspPipeFileService.exe run --max-reg-per-conn 4 --max-reg-per-user 8 --max-conn-per-user 3
+#   PipeFileService.exe run --max-reg-per-conn 4 --max-reg-per-user 8 --max-conn-per-user 3
 #   .\tests\limits.ps1 -PerConn 4 -PerUser 8 -ConnPerUser 3
 # PerUser must be a multiple of PerConn, and ConnPerUser at least PerUser / PerConn + 1.
 param([int]$PerConn = 64, [int]$PerUser = 256, [int]$ConnPerUser = 16)
@@ -13,7 +13,7 @@ function Check($name, $ok, $detail) {
     if ($ok) { "PASS  $name" } else { "FAIL  $name   $detail"; $script:failures++ }
 }
 function New-Client {
-    $c = New-Object IO.Pipes.NamedPipeClientStream('.', 'FspPipeFileService', 'InOut')
+    $c = New-Object IO.Pipes.NamedPipeClientStream('.', 'PipeFileService', 'InOut')
     $c.Connect(5000); $c.ReadMode = 'Message'
     $c
 }
