@@ -318,6 +318,11 @@ time from the installed WinFsp, printing "WinFsp is not installed" if it is
 missing. `pipe-file-mount.exe --version` works without WinFsp. The same script builds
 `PipeFileService.exe`.
 
+`PipeFileService.exe` is built from two parts: `src\pfs_core.c` (control pipe, registrations, limits,
+placeholder links, fetch on first read, service install) and one file system driver backend
+(`src\pfs_backend_winfsp.c`), joined by the interface in `src\pfs_backend.h`. A build links exactly
+one backend, so the exe references exactly one driver.
+
 ## Releases
 
 Releases are built by GitHub Actions when a tag is pushed. The tag must match

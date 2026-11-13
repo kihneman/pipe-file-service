@@ -29,6 +29,6 @@ cl /nologo /W3 /std:c11 /MT /Fo:build\ /Fe:pipe-file-mount.exe src\pipe-file-mou
     /I"$WinFsp\inc" /link "$WinFsp\lib\winfsp-x64.lib" advapi32.lib delayimp.lib /DELAYLOAD:winfsp-x64.dll
 if ($LASTEXITCODE -ne 0) { throw "cl.exe failed with exit code $LASTEXITCODE" }
 
-cl /nologo /W3 /std:c11 /MT /Fo:build\ /Fe:PipeFileService.exe src\PipeFileService.c `
+cl /nologo /W3 /std:c11 /MT /Fo:build\ /Fe:PipeFileService.exe src\pfs_core.c src\pfs_backend_winfsp.c `
     /I"$WinFsp\inc" /link "$WinFsp\lib\winfsp-x64.lib" advapi32.lib delayimp.lib /DELAYLOAD:winfsp-x64.dll
 if ($LASTEXITCODE -ne 0) { throw "cl.exe failed with exit code $LASTEXITCODE" }
