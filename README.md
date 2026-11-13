@@ -88,9 +88,9 @@ long-running service, on one WinFsp volume, that any local user's app can ask to
    privileged process may create file symlinks without Developer Mode.
 
 ```
-FspPipeFileService.exe install [--mount <folder that does not exist, or a drive letter>] [--auto-start]   (elevated)
-FspPipeFileService.exe uninstall                                                                          (elevated)
-FspPipeFileService.exe run [--mount <...>] [--winfsp-dir <folder>]    run in this console (elevated), for development
+FspPipeFileService.exe install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [limits]   (elevated)
+FspPipeFileService.exe uninstall                                                                                  (elevated)
+FspPipeFileService.exe run [--mount <...>] [--winfsp-dir <folder>] [limits]    run in this console (elevated), for development
 ```
 
 The default mount is `C:\ProgramData\FspPipeFileService\mount` (a WinFsp mount
@@ -149,8 +149,32 @@ Requests (all may carry a numeric `id`, which is echoed in the reply):
 Replies have `"type":"reply"` and `"status":"ok"` or `"error"`. On success
 `register` returns `path` (the file inside the mount) and `linked`. Errors carry
 `code` (`bad_request`, `bad_name`, `pipe_unreachable`, `name_in_use`, `link_refused`,
-`not_found`, `driver_not_installed`) and a `message`. The service pushes events, `"type":"event"`, with
+`not_found`, `driver_not_installed`, `too_many_registrations`) and a `message`. The service pushes events, `"type":"event"`, with
 `event` of `opened`, `denied` or `error`, plus `file` and `reader_pid`.
+
+**Limits** (the pipe is open to every interactive user): a message is at most 64 KB
+(a larger one drops the connection); by default at most 64 registrations per
+connection and 256 per user, beyond which `register` answers
+`too_many_registrations`; at most 128 connections in all (extra ones are hung up on
+before any thread is started) and 16 per user. A connection counts for its user from
+its first message, so a connection that never sends one is only bounded by the total.
+A connection over its user's limit is dropped when it sends its first message.
+`unregister`, or closing a connection, frees slots at once. There is no idle timeout.
+
+The four numbers can be changed when the service is installed (`install` keeps them
+in the service's `Parameters` key, as DWORD values) or for a development `run`:
+
+| option | default | allowed | registry value |
+| --- | --- | --- | --- |
+| `--max-reg-per-conn <n>` | 64 | 1 to 10000 | `MaxRegPerConn` |
+| `--max-reg-per-user <n>` | 256 | 1 to 100000 | `MaxRegPerUser` |
+| `--max-conn <n>` | 128 | 1 to 10000 | `MaxConn` |
+| `--max-conn-per-user <n>` | 16 | 1 to 10000 | `MaxConnPerUser` |
+
+The service reads them when it starts, so changing a value later means restarting
+the service. A missing value keeps the default; an out-of-range value is logged and
+ignored. `run` uses only its own options, never the registry. The effective limits
+are logged at start.
 
 Before accepting a registration the service opens the pipe it would read **as the
 caller** and refuses if that fails, so a caller cannot register a pipe it cannot
@@ -250,6 +274,7 @@ Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated;
 .\tests\service-down.ps1      # elevated: stop + uninstall + check nothing is left
 ```
 
+`tests\limits.ps1` (unelevated, service running) checks the control-pipe limits.
 `tests\driver-missing.ps1` checks the WinFsp-missing behaviour with `--winfsp-dir`
 (the first part runs unelevated; the rest needs an elevated shell and no running
 service). `tests\install-chain.ps1` is for a clean VM (elevated): service installed

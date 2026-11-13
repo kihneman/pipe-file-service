@@ -30,6 +30,18 @@
 #define MAX_PATHW 1024
 #define MAX_MSG 65536
 
+// Limits on the control pipe, which every interactive user can open. The defaults can be changed with
+// `install --max-...` (kept in the service's Parameters key) or `run --max-...`; see usage().
+typedef struct { const WCHAR *flag, *value; int def, hi; int cur; BOOL set; } Limit;
+enum { LIM_REG_CONN, LIM_REG_USER, LIM_CONNS, LIM_CONNS_USER, LIM_COUNT };
+static Limit g_limits[LIM_COUNT] = {
+    { L"--max-reg-per-conn", L"MaxRegPerConn", 64, 10000, 64, FALSE },
+    { L"--max-reg-per-user", L"MaxRegPerUser", 256, 100000, 256, FALSE },
+    { L"--max-conn", L"MaxConn", 128, 10000, 128, FALSE },
+    { L"--max-conn-per-user", L"MaxConnPerUser", 16, 10000, 16, FALSE },
+};
+#define LIM(i) (g_limits[i].cur)
+
 // ---------------------------------------------------------------- logging
 
 static FILE *g_log;
@@ -781,6 +793,17 @@ static void do_register(Conn *c, const Json *j, const WCHAR *id)
             LocalFree(e->sd); free(e); return;
         }
     }
+    int mine = 0, theirs = 0;   // this connection's registrations, and all of this user's
+    for (Entry *o = g_entries; o; o = o->next) {
+        if (o->conn == c) mine++;
+        if (o->conn->sid && EqualSid(o->conn->sid, c->sid)) theirs++;
+    }
+    if (mine >= LIM(LIM_REG_CONN) || theirs >= LIM(LIM_REG_USER)) {
+        LeaveCriticalSection(&g_lock);
+        char m[96]; snprintf(m, sizeof m, "at most %d registrations per connection and %d per user", LIM(LIM_REG_CONN), LIM(LIM_REG_USER));
+        send_reply(c, id, "error", "too_many_registrations", m, NULL, -1);
+        LocalFree(e->sd); free(e); return;
+    }
     if (link) {
         char detail[64]; const char *lw = link_placeholder(c, e, link, detail, sizeof detail);
         if (lw) {
@@ -846,6 +869,11 @@ static DWORD WINAPI conn_thread(LPVOID arg)
         if (!c->token) {   // the client's identity can only be taken after the first read
             if (!init_conn(c)) { logf_("rejected a client (no usable identity)"); break; }
             WCHAR *sid = NULL; ConvertSidToStringSidW(c->sid, &sid);
+            EnterCriticalSection(&g_lock);
+            int same = 0;
+            for (Conn *o = g_conns; o; o = o->next) if (o->sid && EqualSid(o->sid, c->sid)) same++;
+            LeaveCriticalSection(&g_lock);
+            if (same > LIM(LIM_CONNS_USER)) { logf_("rejected a client: %ls already has %d connections", sid, LIM(LIM_CONNS_USER)); LocalFree(sid); break; }
             logf_("client connected: %ls%s", sid, c->elevated ? " (elevated)" : ""); LocalFree(sid);
         }
         int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, buf, (int)got, wbuf, MAX_MSG - 1);
@@ -883,7 +911,8 @@ static BOOL init_conn(Conn *c)
     if (ok) {
         TOKEN_USER *u = (TOKEN_USER *)buf;
         DWORD sl = GetLengthSid(u->User.Sid);
-        c->sid = (PSID)malloc(sl); CopySid(sl, c->sid, u->User.Sid);
+        PSID mine = (PSID)malloc(sl); CopySid(sl, mine, u->User.Sid);
+        EnterCriticalSection(&g_lock); c->sid = mine; LeaveCriticalSection(&g_lock);   // other connections read it under the lock
         c->elevated = GetTokenInformation(t, TokenElevation, &el, sizeof el, &n) && el.TokenIsElevated;
         c->token = dup;
     }
@@ -923,6 +952,16 @@ static DWORD WINAPI accept_thread(LPVOID arg)
             DWORD x; ok = GetOverlappedResult(p, &ov, &x, FALSE);
         } else if (!ok && e == ERROR_PIPE_CONNECTED) ok = TRUE;
         if (!ok) { CloseHandle(p); continue; }
+        EnterCriticalSection(&g_lock);
+        int open_conns = 0;
+        for (Conn *o = g_conns; o; o = o->next) open_conns++;
+        LeaveCriticalSection(&g_lock);
+        if (open_conns >= LIM(LIM_CONNS)) {   // no thread, no buffers: just hang up
+            static DWORD last_log;
+            if (GetTickCount() - last_log > 5000) { last_log = GetTickCount(); logf_("too many control connections (%d); dropping new ones", LIM(LIM_CONNS)); }
+            DisconnectNamedPipe(p); CloseHandle(p);
+            continue;
+        }
         Conn *c = (Conn *)calloc(1, sizeof *c);
         c->pipe = p; c->refs = 2;   // one for the thread, one for the list owner (released below)
         InitializeCriticalSection(&c->wlock);
@@ -1048,6 +1087,8 @@ static int serve(const WCHAR *mount)
 
     HANDLE acc = CreateThread(NULL, 0, accept_thread, NULL, 0, NULL);
     logf_("serving on %ls; control pipe %ls", g_mount, CONTROL_PIPE);
+    logf_("limits: %d registrations per connection, %d per user; %d connections, %d per user",
+        LIM(LIM_REG_CONN), LIM(LIM_REG_USER), LIM(LIM_CONNS), LIM(LIM_CONNS_USER));
     WaitForSingleObject(g_stop, INFINITE);
 
     WaitForSingleObject(acc, 5000); CloseHandle(acc);
@@ -1095,6 +1136,21 @@ static void read_mount_param(WCHAR *out, DWORD cap)
         wcscpy_s(out, cap, DEFAULT_MOUNT);
 }
 
+// Service mode: limits come from the Parameters key; a missing value keeps the default, a bad one is ignored.
+static void read_limit_params(void)
+{
+    for (int i = 0; i < LIM_COUNT; i++) {
+        DWORD v = 0, sz = sizeof v;
+        LONG r = RegGetValueW(HKEY_LOCAL_MACHINE, PARAM_KEY, g_limits[i].value, RRF_RT_REG_DWORD, NULL, &v, &sz);
+        if (r == ERROR_FILE_NOT_FOUND) continue;
+        if (r != ERROR_SUCCESS || v < 1 || v > (DWORD)g_limits[i].hi) {
+            logf_("ignoring %ls: it must be a number from 1 to %d; using %d", g_limits[i].value, g_limits[i].hi, g_limits[i].def);
+            continue;
+        }
+        g_limits[i].cur = (int)v;
+    }
+}
+
 static void WINAPI svc_main(DWORD argc, LPWSTR *argv)
 {
     (void)argc; (void)argv;
@@ -1104,6 +1160,7 @@ static void WINAPI svc_main(DWORD argc, LPWSTR *argv)
     g_log = _wfopen(L"C:\\ProgramData\\FspPipeFileService\\service.log", L"a");
     g_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
     WCHAR mount[MAX_PATHW]; read_mount_param(mount, MAX_PATHW);
+    read_limit_params();
     set_state(SERVICE_RUNNING, SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN);
     int rc = serve(mount);
     if (!rc && !g_log) rc = 0;
@@ -1137,6 +1194,8 @@ static int install(const WCHAR *mount, BOOL auto_start)
     HKEY k;
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, PARAM_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) == ERROR_SUCCESS) {
         RegSetValueExW(k, L"MountPoint", 0, REG_SZ, (const BYTE *)mount, (DWORD)((wcslen(mount) + 1) * sizeof(WCHAR)));
+        for (int i = 0; i < LIM_COUNT; i++)
+            if (g_limits[i].set) { DWORD v = (DWORD)g_limits[i].cur; RegSetValueExW(k, g_limits[i].value, 0, REG_DWORD, (const BYTE *)&v, sizeof v); }
         RegCloseKey(k);
     }
     CloseServiceHandle(s); CloseServiceHandle(scm);
@@ -1167,13 +1226,32 @@ static int usage(void)
 {
     fwprintf(stderr,
         L"usage: FspPipeFileService <command>\n"
-        L"  install [--mount <folder that does not exist, or a drive letter>] [--auto-start]   (elevated)\n"
+        L"  install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [limits]   (elevated)\n"
         L"  uninstall                                                           (elevated)\n"
-        L"  run [--mount <...>] [--winfsp-dir <folder>]   run in this console (elevated), for development;\n"
+        L"  run [--mount <...>] [--winfsp-dir <folder>] [limits]   run in this console (elevated), for development;\n"
+        L"  limits on the control pipe (defaults in brackets; install keeps them for the service):\n"
+        L"      --max-reg-per-conn <n> [64]   --max-reg-per-user <n> [256]\n"
+        L"      --max-conn <n> [128]          --max-conn-per-user <n> [16]\n"
         L"      --winfsp-dir makes the WinFsp check look for <folder>\\bin\\winfsp-x64.dll instead of the real install\n"
         L"  --version\n"
         L"default mount: %ls\n", DEFAULT_MOUNT);
     return 2;
+}
+
+// `--max-... <n>`: sets the limit and returns TRUE when the flag is one of ours; exits with a message on a bad number.
+static BOOL parse_limit_arg(const wchar_t *flag, const wchar_t *text)
+{
+    for (int i = 0; i < LIM_COUNT; i++) {
+        if (0 != wcscmp(flag, g_limits[i].flag)) continue;
+        wchar_t *end = NULL; long v = wcstol(text, &end, 10);
+        if (text[0] == 0 || *end || v < 1 || v > g_limits[i].hi) {
+            fwprintf(stderr, L"%ls must be a number from 1 to %d\n", flag, g_limits[i].hi);
+            exit(2);
+        }
+        g_limits[i].cur = (int)v; g_limits[i].set = TRUE;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 int wmain(int argc, wchar_t **argv)
@@ -1191,6 +1269,7 @@ int wmain(int argc, wchar_t **argv)
         if (0 == wcscmp(argv[i], L"--mount") && i + 1 < argc && argv[i + 1][0]) mount = argv[++i];
         else if (is_install && 0 == wcscmp(argv[i], L"--auto-start")) auto_start = TRUE;
         else if (is_run && 0 == wcscmp(argv[i], L"--winfsp-dir") && i + 1 < argc && argv[i + 1][0]) wcscpy_s(g_winfsp_dir, MAX_PATHW, argv[++i]);   // never read in service mode
+        else if ((is_install || is_run) && i + 1 < argc && parse_limit_arg(argv[i], argv[i + 1])) i++;
         else return usage();
     }
     if (is_install) return install(mount, auto_start);
