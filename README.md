@@ -323,6 +323,31 @@ placeholder links, fetch on first read, service install) and one file system dri
 (`src\pfs_backend_winfsp.c`), joined by the interface in `src\pfs_backend.h`. A build links exactly
 one backend, so the exe references exactly one driver.
 
+### Backends: WinFsp or Dokan
+
+`build.ps1 -Backend winfsp|dokan|all` builds `PipeFileService-winfsp.exe` and/or `PipeFileService-dokan.exe`
+(and `pipe-file-mount-winfsp.exe`). The two services behave the same: same service name
+(`PipeFileService`), same control pipe, same protocol, same file names. Only the driver differs, and each exe
+references exactly one: the WinFsp build does not mention Dokan and the other way round, and both delay-load
+their driver's DLL. Install whichever driver you ship; `install` and `uninstall` work the same.
+
+The Dokan backend (Dokany 2.x) differs where the driver does:
+
+- The driver is the file system driver service `Dokan2` plus `dokan2.dll` in the system folder; the service
+  logs one line, opens no control pipe and exits 0 when either is missing (like WinFsp).
+- A Dokan mount folder must exist and be empty, and a clean unmount leaves a stale junction behind. The service
+  creates the folder at start and removes the junction at stop, so `--mount` still names a folder that does not
+  exist.
+- Dokan does not enforce per-file permissions itself. The backend checks the opener's token against the file's
+  security descriptor, so the file is readable only by the registering user and SYSTEM, as with WinFsp.
+- The driver unmounts a volume when one request stays pending longer than its timeout (15 s by default). A
+  first read can wait for the data server (for example for the user to approve the reader), so the backend sets
+  the 5-minute maximum and extends it on every read. `tests\slow-read.ps1` covers it.
+- `run --dokan-dir <folder>` (development only) replaces `run --winfsp-dir`.
+
+`scripts\get-dokan-sdk.ps1` fetches the Dokan headers and import library (every download checked against a
+pinned SHA-256) without installing the driver.
+
 ## Releases
 
 Releases are built by GitHub Actions when a tag is pushed. The tag must match
@@ -405,3 +430,7 @@ MIT (see `LICENSE`). This program links to the WinFsp DLL under WinFsp's
 it must stay under an open-source licence and must not be linked or
 distributed together with proprietary software. Distribute WinFsp itself only
 as the unmodified installer released by the WinFsp project.
+
+The Dokan build uses [Dokan](https://github.com/dokan-dev/dokany) (Dokany) 2.x. Its user-mode library
+(`dokan2.dll`) and driver are LGPL licensed; this program loads the library dynamically and does not contain
+it. Distribute Dokan itself only as the unmodified installer released by the Dokan project.

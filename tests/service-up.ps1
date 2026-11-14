@@ -2,7 +2,7 @@
 # Then run tests\service-smoke.ps1 (an ordinary, unelevated PowerShell is the realistic caller),
 # and finally tests\service-down.ps1.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\PipeFileService.exe'),
+    [string]$Backend = 'winfsp', [string]$Exe = (Join-Path $PSScriptRoot "..\PipeFileService-$Backend.exe"),
     [string]$Mount = 'C:\ProgramData\PipeFileService\mount'
 )
 $ErrorActionPreference = 'Stop'

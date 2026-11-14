@@ -3,7 +3,7 @@
 # counting fake server (count-server.ps1). Needs WinFsp installed and the mount tool
 # built; use a free drive letter. Windows PowerShell 5.1 or later.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\pipe-file-mount.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\pipe-file-mount-winfsp.exe'),
     [string]$Drive = 'K'
 )
 $ErrorActionPreference = 'Stop'

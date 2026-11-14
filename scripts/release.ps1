@@ -26,10 +26,10 @@ if ($Tag) {
 }
 
 & (Join-Path $root 'build.ps1') -WinFsp $WinFsp
-$exe = Join-Path $root 'pipe-file-mount.exe'
+$exe = Join-Path $root 'pipe-file-mount-winfsp.exe'
 $reported = (& $exe --version)
 if ($reported -ne "pipe-file-mount $version") { throw "The built binary reports '$reported', expected 'pipe-file-mount $version'." }
-$svcExe = Join-Path $root 'PipeFileService.exe'
+$svcExe = Join-Path $root 'PipeFileService-winfsp.exe'
 $reported = (& $svcExe --version)
 if ($reported -ne "PipeFileService $version") { throw "The built service reports '$reported', expected 'PipeFileService $version'." }
 
@@ -52,7 +52,7 @@ $notes = @"
 pipe-file-mount $releaseVersion (experimental, Windows x64)
 
 Exposes a Windows named pipe as a read-only file on a WinFsp volume.
-``pipe-file-mount.exe`` does it for one pipe in one process; ``PipeFileService.exe`` is a
+``pipe-file-mount-winfsp.exe`` does it for one pipe in one process; ``PipeFileService-winfsp.exe`` is a
 Windows service that does it for any local user's app and can link placeholder files to the
 pipes (see the README).
 
