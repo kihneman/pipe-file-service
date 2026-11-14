@@ -362,20 +362,23 @@ Releases are built by GitHub Actions when a tag is pushed. The tag must match
 git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1
 ```
 
-The workflow attaches a zip (both exes, `LICENSE`, `README.md`) and `SHA256SUMS`.
-`.\scripts\release.ps1 -Tag v0.1.0-rc.1` builds the same files into `dist\`
-locally. The binary is not Authenticode-signed (Windows SmartScreen may warn),
-and WinFsp itself is not bundled.
+The workflow attaches one zip per driver
+(`pipe-file-service-<version>-winfsp-windows-x64.zip` and `...-dokan-windows-x64.zip`, each with its two
+exes, `LICENSE` and `README.md`) and one `SHA256SUMS` for both. The release notes list the SHA-256 of every
+exe. `.\scripts\release.ps1 -Tag v0.1.0-rc.1` builds the same files into `dist\`
+locally (it needs both SDKs). The binaries are not Authenticode-signed (Windows SmartScreen may warn),
+and neither driver is bundled.
 
 ### Verifying a release
 
-Each release's zip and `SHA256SUMS` carry a signed
+Each release's zips, `SHA256SUMS` and executables carry a signed
 [GitHub build attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations),
 which proves they were built by this repository's release workflow from the
 tagged commit (releases before v0.1.2 have none):
 
 ```
-gh attestation verify pipe-file-mount-<version>-windows-x64.zip -R kihneman/pipe-file-service
+gh attestation verify pipe-file-service-<version>-<winfsp|dokan>-windows-x64.zip -R kihneman/pipe-file-service
+gh attestation verify PipeFileService-<winfsp|dokan>.exe -R kihneman/pipe-file-service   # an exe taken out of the zip
 sha256sum -c SHA256SUMS
 ```
 

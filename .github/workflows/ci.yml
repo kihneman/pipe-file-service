@@ -50,6 +50,6 @@ jobs:
       - name: Package and verify the checksums
         shell: pwsh
         run: |
-          ./scripts/release.ps1 -WinFsp $env:WINFSP_SDK
+          ./scripts/release.ps1 -WinFsp $env:WINFSP_SDK -Dokan $env:DOKAN_SDK
           bash -c 'cd dist && sha256sum -c SHA256SUMS'
           if ($LASTEXITCODE -ne 0) { throw 'checksum verification failed' }
