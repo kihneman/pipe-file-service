@@ -13,7 +13,7 @@ $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $Out = [IO.Path]::GetFullPath($Out)
 
 # The single source of the version is the #define in the C file.
-$source = Get-Content (Join-Path $root 'src\pipe-file-mount.c') -Raw
+$source = Get-Content (Join-Path $root 'src\pfm_core.c') -Raw
 if ($source -notmatch '#define MOUNT_VERSION "([^"]+)"') { throw 'MOUNT_VERSION not found in the source.' }
 $version = $Matches[1]
 

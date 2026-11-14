@@ -3,7 +3,7 @@
 #
 # Each backend gives its own pair of programs, so a shipped exe references exactly one driver:
 #   -Backend winfsp  PipeFileService-winfsp.exe, pipe-file-mount-winfsp.exe
-#   -Backend dokan   PipeFileService-dokan.exe
+#   -Backend dokan   PipeFileService-dokan.exe, pipe-file-mount-dokan.exe
 #   -Backend all     both
 #
 # -WinFsp must point at a folder containing inc\winfsp\winfsp.h and
@@ -48,9 +48,10 @@ function Invoke-Cl($out, $objDir, $sources, $include, $lib, $dll) {
 }
 
 if ($buildWinFsp) {
-    Invoke-Cl 'pipe-file-mount-winfsp.exe' 'build\winfsp-mount' @('src\pipe-file-mount.c') "$WinFsp\inc" "$WinFsp\lib\winfsp-x64.lib" 'winfsp-x64.dll'
+    Invoke-Cl 'pipe-file-mount-winfsp.exe' 'build\winfsp-mount' @('src\pfm_core.c', 'src\pfm_backend_winfsp.c') "$WinFsp\inc" "$WinFsp\lib\winfsp-x64.lib" 'winfsp-x64.dll'
     Invoke-Cl 'PipeFileService-winfsp.exe' 'build\winfsp' @('src\pfs_core.c', 'src\pfs_backend_winfsp.c') "$WinFsp\inc" "$WinFsp\lib\winfsp-x64.lib" 'winfsp-x64.dll'
 }
 if ($buildDokan) {
+    Invoke-Cl 'pipe-file-mount-dokan.exe' 'build\dokan-mount' @('src\pfm_core.c', 'src\pfm_backend_dokan.c') "$Dokan\inc" "$Dokan\lib\dokan2.lib" 'dokan2.dll'
     Invoke-Cl 'PipeFileService-dokan.exe' 'build\dokan' @('src\pfs_core.c', 'src\pfs_backend_dokan.c') "$Dokan\inc" "$Dokan\lib\dokan2.lib" 'dokan2.dll'
 }

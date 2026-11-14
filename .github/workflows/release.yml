@@ -1,7 +1,7 @@
 name: release
 
 # Push a tag such as v0.1.0 (or v0.1.0-rc.1 for a pre-release) to publish.
-# The tag must match MOUNT_VERSION in src\pipe-file-mount.c.
+# The tag must match MOUNT_VERSION in src\pfm_core.c.
 on:
   push:
     tags: ['v*']
