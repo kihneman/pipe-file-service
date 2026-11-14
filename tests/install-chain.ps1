@@ -12,7 +12,7 @@
 #
 # Copy this repository's PipeFileService.exe, tests\ and the WinFsp MSI (see -WinFspMsi) to the VM.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\PipeFileService.exe'),
+    [string]$Backend = 'winfsp', [string]$Exe = (Join-Path $PSScriptRoot "..\PipeFileService-$Backend.exe"),
     [Parameter(Mandatory)] [string]$WinFspMsi,
     # The MSI this procedure was written and verified against (winfsp-2.1.25156.msi). A different file is refused unless
     # you pass its own hash, so the script never installs something nobody pinned.

@@ -115,6 +115,41 @@ try {
     $wrote = $true; try { Set-Content $file 'x' -ErrorAction Stop } catch { $wrote = $false }
     Check 'writes are refused' (-not $wrote)
 
+    # ---- a caller that is not the registering user is refused. There is only one account to test with, so the
+    # caller is this user with its own SID switched to deny-only (a restricted token): the owner ACE no longer
+    # applies to it, which is what a different user looks like to the file's ACL.
+    Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class DenyOnly {
+    [StructLayout(LayoutKind.Sequential)] struct SidAndAttr { public IntPtr Sid; public uint Attr; }
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr p, uint access, out IntPtr tok);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetTokenInformation(IntPtr tok, int cls, IntPtr buf, int len, out int ret);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool CreateRestrictedToken(IntPtr tok, uint flags, int nDisable, SidAndAttr[] disable, int nPriv, IntPtr priv, int nRestrict, IntPtr restrict, out IntPtr newTok);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool DuplicateToken(IntPtr tok, int level, out IntPtr dup);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool SetThreadToken(IntPtr thread, IntPtr tok);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    // Makes the calling thread run as this user with the user's own SID denied-only. Returns false on failure.
+    public static bool Begin() {
+        IntPtr tok, restricted, imp;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0002 | 0x0008, out tok)) return false;   // DUPLICATE | QUERY
+        int len; GetTokenInformation(tok, 1, IntPtr.Zero, 0, out len);                          // TokenUser
+        IntPtr buf = Marshal.AllocHGlobal(len);
+        if (!GetTokenInformation(tok, 1, buf, len, out len)) return false;
+        SidAndAttr[] d = new SidAndAttr[] { new SidAndAttr { Sid = Marshal.ReadIntPtr(buf), Attr = 0 } };
+        if (!CreateRestrictedToken(tok, 0, 1, d, 0, IntPtr.Zero, 0, IntPtr.Zero, out restricted)) return false;
+        if (!DuplicateToken(restricted, 2, out imp)) return false;                               // SecurityImpersonation
+        return SetThreadToken(IntPtr.Zero, imp);
+    }
+    public static void End() { SetThreadToken(IntPtr.Zero, IntPtr.Zero); }
+}
+'@
+    $denied = $null; $began = [DenyOnly]::Begin()
+    try { try { $null = [IO.File]::ReadAllText($file); $denied = $false } catch [UnauthorizedAccessException] { $denied = $true } catch { $denied = "other: $($_.Exception.Message)" } }
+    finally { [DenyOnly]::End() }
+    Check 'a caller that is not the registering user cannot read the file' ($began -and $denied -eq $true) "began=$began denied=$denied"
+    Check 'the registering user still can' (([IO.File]::ReadAllText($file)) -eq $content)
+
     # ---- registration rules
     $r = Reg $c "$base-d" 'other.env'
     Check 'same pipe twice is refused' ($r.status -eq 'error' -and $r.code -eq 'name_in_use') ($r | ConvertTo-Json -Compress)

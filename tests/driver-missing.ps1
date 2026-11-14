@@ -1,15 +1,17 @@
-# Tests how PipeFileService behaves when WinFsp is missing, without needing a machine that lacks WinFsp:
-# `run --winfsp-dir <folder>` (a development switch that only exists in run mode) makes the WinFsp check look
-# for <folder>\bin\winfsp-x64.dll instead of the real install.
+# Tests how PipeFileService behaves when its driver (WinFsp or Dokan, see -Backend) is missing, without needing a
+# machine that lacks it: `run --winfsp-dir <folder>` / `run --dokan-dir <folder>` (a development switch that only
+# exists in run mode) makes the check look for <folder>\bin\winfsp-x64.dll / <folder>\dokan2.dll instead of the real install.
 #
 #   missing at start-up   exit code 0, a log line, no control pipe        (runs unelevated)
 #   gone at register      `register` answers driver_not_installed          (needs an ELEVATED shell and the
 #   present at start-up   the control pipe exists and registration works    real WinFsp: it really mounts a volume)
 #
 # Run it from Windows PowerShell 5.1. -Exe selects the binary (the mutation check passes a broken build).
-param([string]$Exe = (Join-Path $PSScriptRoot '..\PipeFileService.exe'))
+param([string]$Backend = 'winfsp', [string]$Exe = (Join-Path $PSScriptRoot "..\PipeFileService-$Backend.exe"))
 $ErrorActionPreference = 'Stop'
 $Exe = [IO.Path]::GetFullPath($Exe)
+# The driver-specific pieces: the name in messages, the development switch, and the file the switch looks for.
+$drv = if ($Backend -eq 'dokan') { @{ Name = 'Dokan'; Flag = '--dokan-dir'; Dll = 'dokan2.dll' } } else { @{ Name = 'WinFsp'; Flag = '--winfsp-dir'; Dll = 'bin\winfsp-x64.dll' } }
 $work = Join-Path $env:TEMP "fsp-driver-missing-$PID"
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $work | Out-Null
@@ -23,9 +25,9 @@ $pipePath = '\\.\pipe\PipeFileService'
 $busy = Test-Path $pipePath
 if ($busy) { 'NOTE  a PipeFileService is already running (the control pipe exists): skipping the checks that need the pipe to be free' }
 
-function Start-Svc($mount, $winfspDir) {
+function Start-Svc($mount, $driverDir) {
     $a = @('run', '--mount', "`"$mount`"")
-    if ($winfspDir) { $a += @('--winfsp-dir', "`"$winfspDir`"") }
+    if ($driverDir) { $a += @($drv.Flag, "`"$driverDir`"") }
     $err = Join-Path $work ("err-" + [guid]::NewGuid().ToString('N') + '.txt')
     $p = Start-Process -FilePath $Exe -ArgumentList $a -WindowStyle Hidden -PassThru -RedirectStandardError $err
     $null = $p.Handle   # PowerShell 5.1 loses ExitCode unless the handle is touched while the process runs
@@ -55,12 +57,12 @@ function Req($c, $h) {
     [Text.Encoding]::UTF8.GetString($ms.ToArray()) | ConvertFrom-Json
 }
 
-# A fake "WinFsp install" for the override: only the file the check looks for.
-$fake = Join-Path $work 'fake-winfsp'
-$empty = Join-Path $work 'no-winfsp'
+# A fake driver install for the override: only the file the check looks for.
+$fake = Join-Path $work 'fake-driver'
+$empty = Join-Path $work 'no-driver'
 New-Item -ItemType Directory $empty | Out-Null
 
-# ---- 1. WinFsp missing at start-up (unelevated is enough: the service gives up before touching anything)
+# ---- 1. driver missing at start-up (unelevated is enough: the service gives up before touching anything)
 $p = Start-Svc (Join-Path $work 'mount1') $empty
 $exited = $p.Proc.WaitForExit(10000)
 Check 'missing: the process exits by itself' $exited 'still running after 10 s'
@@ -69,24 +71,24 @@ if ($exited) {
 }
 Stop-Svc $p
 $log = Get-Content $p.Err -Raw
-Check 'missing: one log line says WinFsp is not installed' ($log -match 'WinFsp is not installed') $log
+Check "missing: one log line says $($drv.Name) is not installed" ($log -match "$($drv.Name) is not installed") $log
 if ($busy) { 'SKIP  missing: no control pipe' } else { Check 'missing: no control pipe' (-not (Test-Path $pipePath)) 'the control pipe exists' }
 Check 'missing: nothing mounted' (-not (Test-Path (Join-Path $work 'mount1'))) 'mount folder exists'
 
 # ---- 2. the override is run-mode only
 $ErrorActionPreference = 'Continue'   # native stderr must not throw
-$out = & $Exe service --winfsp-dir $empty 2>&1 | Out-String
+$out = & $Exe service $drv.Flag $empty 2>&1 | Out-String
 Check 'override is refused outside run mode' ($LASTEXITCODE -eq 2) "exit $LASTEXITCODE"
-$out = & $Exe install --winfsp-dir $empty 2>&1 | Out-String
+$out = & $Exe install $drv.Flag $empty 2>&1 | Out-String
 Check 'override is refused by install' ($LASTEXITCODE -eq 2) "exit $LASTEXITCODE"
 $ErrorActionPreference = 'Stop'
 
-# ---- 3 and 4 need the real WinFsp and an elevated shell
+# ---- 3 and 4 need the real driver and an elevated shell
 if ($busy -or -not $elevated) {
     'SKIP  present-at-start and gone-at-register: need an elevated shell and no running PipeFileService'
 } else {
-    New-Item -ItemType Directory (Join-Path $fake 'bin') -Force | Out-Null
-    $dummy = Join-Path $fake 'bin\winfsp-x64.dll'
+    $dummy = Join-Path $fake $drv.Dll
+    New-Item -ItemType Directory (Split-Path $dummy) -Force | Out-Null
     Set-Content $dummy 'not a dll'
     $p = Start-Svc (Join-Path $work 'mount2') $fake
     $up = Wait-Pipe $p 20
@@ -96,7 +98,7 @@ if ($busy -or -not $elevated) {
         $c = New-Client
         $r = Req $c @{ type = 'register'; id = '1'; pipe = "\\.\pipe\fsp-dm-$PID"; file_name = 'a.env' }
         Check 'present: register works' ($r.status -eq 'ok') ($r | ConvertTo-Json -Compress)
-        Remove-Item $dummy -Force   # WinFsp "disappears" while the service runs
+        Remove-Item $dummy -Force   # the driver "disappears" while the service runs
         $r = Req $c @{ type = 'register'; id = '2'; pipe = "\\.\pipe\fsp-dm-$PID"; file_name = 'b.env' }
         Check 'gone: register answers driver_not_installed' ($r.status -eq 'error' -and $r.code -eq 'driver_not_installed') ($r | ConvertTo-Json -Compress)
         $r = Req $c @{ type = 'unregister'; id = '3'; pipe = "\\.\pipe\fsp-dm-$PID" }
@@ -104,10 +106,10 @@ if ($busy -or -not $elevated) {
         $c.Dispose(); $data.Dispose()
     }
     Stop-Svc $p
-    # real WinFsp, no override
+    # real driver, no override
     Start-Sleep -Seconds 1
     $p = Start-Svc (Join-Path $work 'mount3') $null
-    Check 'real WinFsp: the control pipe appears' (Wait-Pipe $p 20) (Get-Content $p.Err -Raw)
+    Check "real $($drv.Name): the control pipe appears" (Wait-Pipe $p 20) (Get-Content $p.Err -Raw)
     Stop-Svc $p
 }
 

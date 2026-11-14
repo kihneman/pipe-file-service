@@ -6,7 +6,7 @@
 #
 #   1. every test script ends with an explicit `exit` (needs nothing installed);
 #   2. driver-missing.ps1, which deliberately runs a command that exits with 2, still exits with 0 when it passes
-#      (needs a built PipeFileService.exe; skipped without it).
+#      (needs a built PipeFileService-winfsp.exe; skipped without it).
 $ErrorActionPreference = 'Stop'
 $script:failures = 0
 function Check($name, $ok, $detail) {
@@ -18,9 +18,9 @@ foreach ($name in 'driver-missing', 'limits', 'smoke', 'lazy-fetch', 'service-sm
     Check "$name.ps1 ends with an explicit exit" ($lines[-1] -match '^\s*exit\b') $lines[-1]
 }
 
-$exe = Join-Path $PSScriptRoot '..\PipeFileService.exe'
+$exe = Join-Path $PSScriptRoot '..\PipeFileService-winfsp.exe'
 if (-not (Test-Path $exe)) {
-    'SKIP  driver-missing.ps1 exit code: build PipeFileService.exe first'
+    'SKIP  driver-missing.ps1 exit code: build PipeFileService-winfsp.exe first'
 } else {
     $script = Join-Path $PSScriptRoot 'driver-missing.ps1'
     # The same way a CI step runs a script: call it, then exit with the last native exit code.

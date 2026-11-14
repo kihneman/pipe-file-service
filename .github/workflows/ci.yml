@@ -22,20 +22,28 @@ jobs:
           $sdk = ./scripts/get-winfsp-sdk.ps1
           "WINFSP_SDK=$sdk" >> $env:GITHUB_ENV
 
-      - name: Build
-        shell: pwsh
-        run: ./build.ps1 -WinFsp $env:WINFSP_SDK
-
-      # Needs no WinFsp driver: the DLL is delay-loaded and --version exits first.
-      - name: Check the binary starts
+      - name: Get the Dokan SDK
         shell: pwsh
         run: |
-          $out = ./pipe-file-mount.exe --version
+          $sdk = ./scripts/get-dokan-sdk.ps1
+          "DOKAN_SDK=$sdk" >> $env:GITHUB_ENV
+
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -Backend all -WinFsp $env:WINFSP_SDK -Dokan $env:DOKAN_SDK
+
+      # Needs no driver: the DLLs are delay-loaded and --version exits first.
+      - name: Check the binaries start
+        shell: pwsh
+        run: |
+          $out = ./pipe-file-mount-winfsp.exe --version
           if ($LASTEXITCODE -ne 0 -or $out -notmatch '^pipe-file-mount \d') { throw "unexpected output: $out" }
           $out
-          $out = ./PipeFileService.exe --version
-          if ($LASTEXITCODE -ne 0 -or $out -notmatch '^PipeFileService \d') { throw "unexpected output: $out" }
-          $out
+          foreach ($b in 'winfsp', 'dokan') {
+            $out = & "./PipeFileService-$b.exe" --version
+            if ($LASTEXITCODE -ne 0 -or $out -notmatch '^PipeFileService \d') { throw "unexpected output: $out" }
+            $out
+          }
 
       # The same packaging a release uses; checked with GNU sha256sum, which
       # rejects CRLF checksum files.

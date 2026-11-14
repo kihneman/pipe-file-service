@@ -2,7 +2,7 @@
 # Run in an ELEVATED PowerShell. If service-smoke.ps1 -LeaveLinked left a registration
 # behind, this also checks that stopping the service removed its link.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\PipeFileService.exe'),
+    [string]$Backend = 'winfsp', [string]$Exe = (Join-Path $PSScriptRoot "..\PipeFileService-$Backend.exe"),
     [string]$Mount = 'C:\ProgramData\PipeFileService\mount'
 )
 $ErrorActionPreference = 'Continue'
@@ -26,7 +26,7 @@ Start-Sleep -Seconds 1
 "mount point present:   $(Test-Path $Mount)"
 "data folder left:      $(Test-Path 'C:\ProgramData\PipeFileService')"
 "parameters key left:   $(Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\PipeFileService')"
-"process left:          $([bool](Get-Process PipeFileService -ErrorAction SilentlyContinue))"
+"process left:          $([bool](Get-Process PipeFileService-* -ErrorAction SilentlyContinue))"
 "control pipe left:     $(Test-Path '\\.\pipe\PipeFileService')"
 Remove-Item (Join-Path $env:TEMP 'fsp-service-smoke-adminowned') -Force -ErrorAction SilentlyContinue
 Remove-Item $left -Recurse -Force -ErrorAction SilentlyContinue
