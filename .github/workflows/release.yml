@@ -25,18 +25,25 @@ jobs:
           $sdk = ./scripts/get-winfsp-sdk.ps1
           "WINFSP_SDK=$sdk" >> $env:GITHUB_ENV
 
+      - name: Get the Dokan SDK
+        shell: pwsh
+        run: |
+          $sdk = ./scripts/get-dokan-sdk.ps1
+          "DOKAN_SDK=$sdk" >> $env:GITHUB_ENV
+
       - name: Build and package
         shell: pwsh
-        run: ./scripts/release.ps1 -Tag $env:GITHUB_REF_NAME -WinFsp $env:WINFSP_SDK
+        run: ./scripts/release.ps1 -Tag $env:GITHUB_REF_NAME -WinFsp $env:WINFSP_SDK -Dokan $env:DOKAN_SDK
 
       # Signed statement that these files were built by this workflow from this
-      # tag; check with: gh attestation verify <zip> -R kihneman/pipe-file-service
+      # tag; check with: gh attestation verify <zip or exe> -R kihneman/pipe-file-service
       - name: Attest the build provenance
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/*.zip
             dist/SHA256SUMS
+            dist/exe/*.exe
 
       - name: Publish the release
         shell: pwsh
@@ -44,7 +51,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          $zip = Get-ChildItem dist -Filter *.zip | Select-Object -First 1
-          $ghArgs = @($tag, $zip.FullName, 'dist/SHA256SUMS', '--title', "pipe-file-mount $($tag.Substring(1))", '--notes-file', 'dist/RELEASE_NOTES.md', '--verify-tag')
+          $zips = @(Get-ChildItem dist -Filter *.zip | ForEach-Object FullName)
+          if ($zips.Count -ne 2) { throw "expected two zips, found $($zips.Count)" }
+          $ghArgs = @($tag) + $zips + @('dist/SHA256SUMS', '--title', "pipe-file-service $($tag.Substring(1))", '--notes-file', 'dist/RELEASE_NOTES.md', '--verify-tag')
           if ($tag -match '-') { $ghArgs += '--prerelease' }
           gh release create @ghArgs
