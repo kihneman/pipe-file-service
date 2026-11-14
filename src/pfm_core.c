@@ -1,25 +1,20 @@
-// pipe-file-mount (experimental): expose one read-only file on a WinFsp
-// volume whose content is read from a Windows named pipe each time the file is
-// opened for reading. Nothing is written to disk. The file can sit at any path
-// on the volume; the directories above it are virtual and read-only. The
-// caller's PID and image are logged at open time, which is where WinFsp
-// reports them.
+// pipe-file-mount (experimental): expose one read-only file on a user-mode file system
+// volume (WinFsp or Dokan, see pfm_backend.h) whose content is read from a Windows named pipe
+// the first time a handle reads it. Nothing is written to disk. The file can sit at any path
+// on the volume; the directories above it are virtual and read-only. The caller's PID and
+// image are logged at open time, which is where the drivers report them.
 //
-// MIT licensed. Uses WinFsp - Windows File System Proxy,
-// Copyright (C) Bill Zissimopoulos - https://github.com/winfsp/winfsp
-#define UNICODE
-#define _UNICODE
-#include <winfsp/winfsp.h>
+// MIT licensed. This file is driver independent; the backend that is linked with it carries the
+// driver's notices.
+#include "pfm_backend.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <sddl.h>
-
 #define MOUNT_VERSION "0.6.0"   // scripts/release.ps1 reads this; release tags must match it
 #define DEFAULT_PATH L"\\property-file.env"
 #define DENIED_PREFIX "Access denied: you do not have permission"
 #define MAX_DEPTH 32
-#define MAX_COMPONENT 255
 #define MAX_PATH_CHARS 2048
 
 static WCHAR g_pipe[512];
@@ -40,7 +35,7 @@ static int g_ncomp;
 // concurrent first reads on one handle share one fetch; `result` is remembered so
 // later reads repeat the outcome without asking the server again.
 typedef struct {
-    int depth; BYTE *data; SIZE_T len; PVOID dirbuf;
+    int depth; BYTE *data; SIZE_T len;
     BOOL want_data;                 // opened with read access
     UINT32 pid; UINT64 start; HANDLE proc;   // reader identity (reader-info mode)
     SRWLOCK lock; BOOL done; NTSTATUS result;
@@ -93,7 +88,7 @@ static BOOL parse_path(const wchar_t *in, const char **why)
 }
 
 // Returns the depth of `name` in the served tree, or -1 if it is not part of it.
-static int lookup(PWSTR name)
+static int lookup(const WCHAR *name)
 {
     if (0 == wcscmp(name, L"\\")) return 0;
     for (int i = 0; i < g_ncomp; i++)
@@ -103,9 +98,8 @@ static int lookup(PWSTR name)
 
 static BOOL is_file(int depth) { return depth == g_ncomp; }
 
-static void caller(char *out, size_t n)
+static void caller(UINT32 pid, char *out, size_t n)
 {
-    UINT32 pid = FspFileSystemOperationProcessIdF();
     WCHAR path[MAX_PATH] = L"?";
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (h) { DWORD l = MAX_PATH; QueryFullProcessImageNameW(h, 0, path, &l); CloseHandle(h); }
@@ -269,16 +263,6 @@ static NTSTATUS ensure_data(Ctx *c)
     return r;
 }
 
-static void fill_info(const Ctx *c, FSP_FSCTL_FILE_INFO *fi)
-{
-    memset(fi, 0, sizeof *fi);
-    BOOL file = is_file(c->depth);
-    fi->FileAttributes = file ? FILE_ATTRIBUTE_READONLY : FILE_ATTRIBUTE_DIRECTORY;
-    fi->FileSize = file ? c->len : 0;
-    fi->AllocationSize = (fi->FileSize + 4095) / 4096 * 4096;
-    fi->CreationTime = fi->LastAccessTime = fi->LastWriteTime = fi->ChangeTime = g_now;
-    fi->IndexNumber = (UINT64)c->depth + 1;
-}
 
 // Only the user who started the mount tool (and SYSTEM) may open anything on the
 // volume: it is a front door to a pipe that only this user may read.
@@ -300,22 +284,28 @@ static BOOL build_sd(void)
     return TRUE;
 }
 
-static NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM *fs, FSP_FSCTL_VOLUME_INFO *vi)
+// ---------------------------------------------------------------- the nodes the backend serves
+
+UINT64 pfm_time(void) { return g_now; }
+
+void pfm_log(const char *fmt, ...)
 {
-    (void)fs;
-    vi->TotalSize = 1 << 20; vi->FreeSize = 0;
-    vi->VolumeLabelLength = (UINT16)(sizeof(L"PipeFile") - sizeof(WCHAR));
-    memcpy(vi->VolumeLabel, L"PipeFile", vi->VolumeLabelLength);
-    return STATUS_SUCCESS;
+    char msg[512];
+    va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof msg, fmt, ap); va_end(ap);
+    logf_("%s", msg);
 }
 
-static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *fs, PWSTR name, PUINT32 attrs,
-    PSECURITY_DESCRIPTOR sd, SIZE_T *sdsz)
+static void fill_info(const Ctx *c, PfmInfo *i)
 {
-    (void)fs;
-    int depth = lookup(name);
-    if (depth < 0) return STATUS_OBJECT_NAME_NOT_FOUND;
-    if (attrs) *attrs = is_file(depth) ? FILE_ATTRIBUTE_READONLY : FILE_ATTRIBUTE_DIRECTORY;
+    BOOL file = is_file(c->depth);
+    i->dir = !file;
+    i->size = file ? c->len : 0;
+    i->id = (UINT64)c->depth + 1;
+    i->time = g_now;
+}
+
+static NTSTATUS copy_sd(PSECURITY_DESCRIPTOR sd, SIZE_T *sdsz)
+{
     if (sdsz) {
         SIZE_T have = *sdsz;
         *sdsz = g_sdsz;
@@ -327,32 +317,24 @@ static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *fs, PWSTR name, PUINT32 attrs
     return STATUS_SUCCESS;
 }
 
-// WinFsp refuses to dispatch creates unless Create and Overwrite exist.
-static NTSTATUS Create(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 opts, UINT32 access, UINT32 attrs,
-    PSECURITY_DESCRIPTOR sd, UINT64 alloc, PVOID *pctx, FSP_FSCTL_FILE_INFO *fi)
+NTSTATUS pfm_get_security(PSECURITY_DESCRIPTOR sd, SIZE_T *sdsz) { return copy_sd(sd, sdsz); }
+
+NTSTATUS pfm_stat(const WCHAR *name, BOOL *dir, PSECURITY_DESCRIPTOR sd, SIZE_T *sdsz)
 {
-    (void)fs; (void)opts; (void)access; (void)attrs; (void)sd; (void)alloc; (void)pctx; (void)fi;
-    logf_("create refused %ls", name);
-    return STATUS_MEDIA_WRITE_PROTECTED;
+    int depth = lookup(name);
+    if (depth < 0) return STATUS_OBJECT_NAME_NOT_FOUND;
+    *dir = !is_file(depth);
+    return copy_sd(sd, sdsz);
 }
 
-static NTSTATUS Overwrite(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT32 attrs, BOOLEAN replace,
-    UINT64 alloc, FSP_FSCTL_FILE_INFO *fi)
+NTSTATUS pfm_open(const WCHAR *name, UINT32 access, UINT32 pid, void **pfile, PfmInfo *info)
 {
-    (void)fs; (void)ctx; (void)attrs; (void)replace; (void)alloc; (void)fi;
-    return STATUS_MEDIA_WRITE_PROTECTED;
-}
-
-static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 opts, UINT32 access,
-    PVOID *pctx, FSP_FSCTL_FILE_INFO *fi)
-{
-    (void)fs; (void)opts;
     int depth = lookup(name);
     if (depth < 0) return STATUS_OBJECT_NAME_NOT_FOUND;
     Ctx *c = (Ctx *)calloc(1, sizeof *c);
     c->depth = depth;
     if (is_file(depth)) {
-        char who[600]; caller(who, sizeof who);
+        char who[600]; caller(pid, who, sizeof who);
         logf_("OPEN  %ls access=0x%08x %s", name, access, who);
         // Opens that are not for reading data (stat, directory listings, AV probes) never
         // read the secret, and neither do opens that close without a Read: the fetch is
@@ -360,31 +342,28 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 opts, UINT32 access
         if (access & FILE_READ_DATA) {
             c->want_data = TRUE;
             if (g_reader_info_pipe[0]) {
-                NTSTATUS st = identify_reader(c, FspFileSystemOperationProcessIdF());
+                NTSTATUS st = identify_reader(c, pid);
                 if (!NT_SUCCESS(st)) { free(c); logf_("  -> 0x%08x", (unsigned)st); return st; }
             }
         }
     }
-    fill_info(c, fi);
-    *pctx = c;
+    fill_info(c, info);
+    *pfile = c;
     return STATUS_SUCCESS;
 }
 
-static VOID Close(FSP_FILE_SYSTEM *fs, PVOID ctx)
+void pfm_close(void *file)
 {
-    (void)fs;
-    Ctx *c = (Ctx *)ctx;
+    Ctx *c = (Ctx *)file;
     if (is_file(c->depth)) logf_("CLOSE");
     if (c->data) { SecureZeroMemory(c->data, c->len); free(c->data); }
     if (c->proc) CloseHandle(c->proc);
-    FspFileSystemDeleteDirectoryBuffer(&c->dirbuf);
     free(c);
 }
 
-static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULONG len, PULONG done)
+NTSTATUS pfm_read(void *file, UINT64 off, ULONG len, void *buf, ULONG *done)
 {
-    (void)fs;
-    Ctx *c = (Ctx *)ctx;
+    Ctx *c = (Ctx *)file;
     if (!is_file(c->depth)) return STATUS_INVALID_DEVICE_REQUEST;
     NTSTATUS st = ensure_data(c);
     if (!NT_SUCCESS(st)) return st;
@@ -395,60 +374,27 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS GetFileInfo(FSP_FILE_SYSTEM *fs, PVOID ctx, FSP_FSCTL_FILE_INFO *fi)
+NTSTATUS pfm_get_info(void *file, PfmInfo *info)
 {
-    (void)fs;
-    Ctx *c = (Ctx *)ctx;
+    Ctx *c = (Ctx *)file;
     AcquireSRWLockShared(&c->lock);   // c->len changes when the first Read fetches
-    fill_info(c, fi);
+    fill_info(c, info);
     ReleaseSRWLockShared(&c->lock);
     return STATUS_SUCCESS;
 }
 
-static void add_entry(Ctx *c, const WCHAR *leaf, BOOL dir, NTSTATUS *result)
+NTSTATUS pfm_list(void *file, BOOL (*visit)(void *ctx, const WCHAR *name, BOOL dir), void *ctx)
 {
-    union { UINT8 b[sizeof(FSP_FSCTL_DIR_INFO) + (MAX_COMPONENT + 1) * sizeof(WCHAR)]; FSP_FSCTL_DIR_INFO d; } u;
-    memset(&u, 0, sizeof u);
-    size_t bytes = wcslen(leaf) * sizeof(WCHAR);
-    u.d.Size = (UINT16)(FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf) + bytes);
-    u.d.FileInfo.FileAttributes = dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_READONLY;
-    u.d.FileInfo.CreationTime = u.d.FileInfo.LastAccessTime = u.d.FileInfo.LastWriteTime = u.d.FileInfo.ChangeTime = g_now;
-    memcpy(u.d.FileNameBuf, leaf, bytes);
-    FspFileSystemFillDirectoryBuffer(&c->dirbuf, &u.d, result);
-}
-
-static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR pattern, PWSTR marker,
-    PVOID buf, ULONG len, PULONG done)
-{
-    (void)fs; (void)pattern;
-    Ctx *c = (Ctx *)ctx;
+    Ctx *c = (Ctx *)file;
     if (is_file(c->depth)) return STATUS_NOT_A_DIRECTORY;
-    NTSTATUS result;
-    if (FspFileSystemAcquireDirectoryBuffer(&c->dirbuf, 0 == marker, &result)) {
-        if (c->depth > 0) {
-            add_entry(c, L".", TRUE, &result);
-            if (NT_SUCCESS(result)) add_entry(c, L"..", TRUE, &result);
-        }
-        // The only child of a directory is the next component on the served path.
-        if (NT_SUCCESS(result)) add_entry(c, g_comp[c->depth], !is_file(c->depth + 1), &result);
-        FspFileSystemReleaseDirectoryBuffer(&c->dirbuf);
+    if (c->depth > 0) {
+        if (!visit(ctx, L".", TRUE)) return STATUS_SUCCESS;
+        if (!visit(ctx, L"..", TRUE)) return STATUS_SUCCESS;
     }
-    if (!NT_SUCCESS(result)) return result;
-    FspFileSystemReadDirectoryBuffer(&c->dirbuf, marker, buf, len, done);
+    // The only child of a directory is the next component on the served path.
+    visit(ctx, g_comp[c->depth], !is_file(c->depth + 1));
     return STATUS_SUCCESS;
 }
-
-static FSP_FILE_SYSTEM_INTERFACE g_iface = {
-    .GetVolumeInfo = GetVolumeInfo,
-    .GetSecurityByName = GetSecurityByName,
-    .Create = Create,
-    .Overwrite = Overwrite,
-    .Open = Open,
-    .Close = Close,
-    .Read = Read,
-    .GetFileInfo = GetFileInfo,
-    .ReadDirectory = ReadDirectory,
-};
 
 static BOOL WINAPI on_ctrl(DWORD t) { (void)t; SetEvent(g_stop); return TRUE; }
 
@@ -481,9 +427,9 @@ int wmain(int argc, wchar_t **argv)
         fprintf(stderr, "invalid path: %s\n", why);
         return 2;
     }
-    // winfsp-x64.dll is delay-loaded so a missing WinFsp gives this message, not a loader error.
-    if (!NT_SUCCESS(FspLoad(0))) {
-        fprintf(stderr, "WinFsp is not installed. Get it from https://winfsp.dev/ or https://github.com/winfsp/winfsp/releases\n");
+    // The driver's DLL is delay-loaded so a missing driver gives this message, not a loader error.
+    if (!pfm_backend.load()) {
+        fprintf(stderr, "%s\n", pfm_backend.not_installed_message);
         return 1;
     }
     wcsncpy_s(g_pipe, 512, argv[1], _TRUNCATE);
@@ -497,27 +443,11 @@ int wmain(int argc, wchar_t **argv)
     if (!build_sd()) { fprintf(stderr, "could not build the volume security descriptor\n"); return 1; }
     SetConsoleCtrlHandler(on_ctrl, TRUE);
 
-    FSP_FSCTL_VOLUME_PARAMS vp; memset(&vp, 0, sizeof vp);
-    vp.SectorSize = 512; vp.SectorsPerAllocationUnit = 1;
-    vp.VolumeCreationTime = g_now;
-    vp.FileInfoTimeout = 1000;       // short attribute cache (the sample default)
-    vp.CasePreservedNames = 1; vp.UnicodeOnDisk = 1; vp.PersistentAcls = 1;
-    vp.FlushAndPurgeOnCleanup = 1;   // drop cached data when the last handle closes
-    vp.UmFileContextIsUserContext2 = 1; vp.PostCleanupWhenModifiedOnly = 1;
-    wcscpy_s(vp.FileSystemName, sizeof vp.FileSystemName / sizeof(WCHAR), L"PipeFile"); // at most 15 characters: the field holds 16 wide chars including the NUL
-
-    FSP_FILE_SYSTEM *fs = NULL;
-    NTSTATUS st = FspFileSystemCreate(L"" FSP_FSCTL_DISK_DEVICE_NAME, &vp, &g_iface, &fs);
-    if (!NT_SUCCESS(st)) { fprintf(stderr, "FspFileSystemCreate failed: 0x%08x\n", (unsigned)st); return 1; }
-    st = FspFileSystemSetMountPoint(fs, (L'*' == argv[2][0] && 0 == argv[2][1]) ? 0 : argv[2]);
-    if (!NT_SUCCESS(st)) { fprintf(stderr, "SetMountPoint failed: 0x%08x\n", (unsigned)st); FspFileSystemDelete(fs); return 1; }
-    st = FspFileSystemStartDispatcher(fs, 0);
-    if (!NT_SUCCESS(st)) { fprintf(stderr, "StartDispatcher failed: 0x%08x\n", (unsigned)st); FspFileSystemDelete(fs); return 1; }
+    if (pfm_backend.start(argv[2])) return 1;
     logf_("serving %ls on %ls from %ls (Ctrl-C to stop)", g_prefix[g_ncomp - 1], argv[2], g_pipe);
     if (g_reader_info_pipe[0]) logf_("reader info: asking %ls who opened the file", g_reader_info_pipe);
     WaitForSingleObject(g_stop, INFINITE);
-    FspFileSystemStopDispatcher(fs);
-    FspFileSystemDelete(fs);
+    pfm_backend.stop();
     logf_("stopped");
     return 0;
 }

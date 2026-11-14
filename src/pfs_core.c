@@ -12,7 +12,7 @@
 #include <sddl.h>
 #include <aclapi.h>
 
-#define SERVICE_VERSION "0.6.0"   // keep equal to MOUNT_VERSION in pipe-file-mount.c
+#define SERVICE_VERSION "0.6.0"   // keep equal to MOUNT_VERSION in pfm_core.c
 #define SVC_NAME L"PipeFileService"
 #define SVC_DISPLAY L"Pipe File Service"
 #define CONTROL_PIPE L"\\\\.\\pipe\\PipeFileService"

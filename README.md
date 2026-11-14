@@ -23,6 +23,8 @@ server: it reads the pipe as an ordinary byte stream, or, with
 pipe-file-mount.exe \\.\pipe\<name> <mountpoint> [path on the volume]
 ```
 
+(Built per driver as `pipe-file-mount-winfsp.exe` or `pipe-file-mount-dokan.exe`; the examples use the short name. See "Backends" below.)
+
 Mounts drive `K:` (or `*` to pick a free letter) containing one file. The file
 is at `\property-file.env` unless you give a path, which may have any number of
 directories before the file name:
@@ -315,7 +317,7 @@ and the WinFsp SDK (headers and import library):
 extracts it without installing anything. The result links the C runtime
 statically (no Visual C++ redistributable) and loads `winfsp-x64.dll` at run
 time from the installed WinFsp, printing "WinFsp is not installed" if it is
-missing. `pipe-file-mount.exe --version` works without WinFsp. The same script builds
+missing. `pipe-file-mount-winfsp.exe --version` works without WinFsp. The same script builds
 `PipeFileService.exe`.
 
 `PipeFileService.exe` is built from two parts: `src\pfs_core.c` (control pipe, registrations, limits,
@@ -326,7 +328,7 @@ one backend, so the exe references exactly one driver.
 ### Backends: WinFsp or Dokan
 
 `build.ps1 -Backend winfsp|dokan|all` builds `PipeFileService-winfsp.exe` and/or `PipeFileService-dokan.exe`
-(and `pipe-file-mount-winfsp.exe`). The two services behave the same: same service name
+(and `pipe-file-mount-winfsp.exe` / `pipe-file-mount-dokan.exe`). The two services behave the same: same service name
 (`PipeFileService`), same control pipe, same protocol, same file names. Only the driver differs, and each exe
 references exactly one: the WinFsp build does not mention Dokan and the other way round, and both delay-load
 their driver's DLL. Install whichever driver you ship; `install` and `uninstall` work the same.
@@ -345,13 +347,15 @@ The Dokan backend (Dokany 2.x) differs where the driver does:
   the 5-minute maximum and extends it on every read. `tests\slow-read.ps1` covers it.
 - `run --dokan-dir <folder>` (development only) replaces `run --winfsp-dir`.
 
+The Dokan `pipe-file-mount` takes the same arguments. A drive letter works as with WinFsp; `*` picks the first free drive letter from Z down and logs it. The volume is visible only to the logon session of the user who started it. A folder as mount point must exist and be empty (it is created if missing).
+
 `scripts\get-dokan-sdk.ps1` fetches the Dokan headers and import library (every download checked against a
 pinned SHA-256) without installing the driver.
 
 ## Releases
 
 Releases are built by GitHub Actions when a tag is pushed. The tag must match
-`MOUNT_VERSION` in `src\pipe-file-mount.c`: `v0.1.0` for a release,
+`MOUNT_VERSION` in `src\pfm_core.c`: `v0.1.0` for a release,
 `v0.1.0-rc.1` (any `-suffix`) for a pre-release.
 
 ```powershell
@@ -379,7 +383,7 @@ sha256sum -c SHA256SUMS
 
 `tests\smoke.ps1` serves a pipe from the script itself, mounts it, and checks
 reads, nested and default paths, case-insensitive lookup, rejected paths, refused
-writes and unmount. It needs WinFsp, a built `pipe-file-mount.exe` and a free
+writes and unmount. It needs the driver of `-Backend` (`winfsp`, the default, or `dokan`), a built `pipe-file-mount-<backend>.exe` and a free
 drive letter (default `K`):
 
 ```powershell

@@ -1,9 +1,10 @@
 # Checks that the mount tool fetches the content on the first Read of a handle, not at
 # Open: programs that open the file and close it never reach the data server. Uses a
-# counting fake server (count-server.ps1). Needs WinFsp installed and the mount tool
+# counting fake server (count-server.ps1). Needs the driver of -Backend (winfsp or dokan) installed and the mount tool
 # built; use a free drive letter. Windows PowerShell 5.1 or later.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\pipe-file-mount-winfsp.exe'),
+    [string]$Backend = 'winfsp',
+    [string]$Exe = (Join-Path $PSScriptRoot "..\pipe-file-mount-$Backend.exe"),
     [string]$Drive = 'K'
 )
 $ErrorActionPreference = 'Stop'

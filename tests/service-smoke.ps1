@@ -181,6 +181,8 @@ public static class DenyOnly {
     $r = Reg $c "$base-r" 'ri.env' @{ reader_info_suffix = '.ri' }
     Check 'register (reader-info suffix)' ($r.status -eq 'ok') ($r | ConvertTo-Json -Compress)
     $riFile = $r.path
+    $listed = @(Get-ChildItem (Split-Path $riFile) | ForEach-Object Name)
+    Check 'the directory lists every registered file' (($listed -contains (Split-Path $file -Leaf)) -and ($listed -contains (Split-Path $riFile -Leaf))) ($listed -join ',')
     $text = [IO.File]::ReadAllText($riFile)
     Check 'first read is served by the reader-info server' ($text -eq $content)
     $req = (Get-Content $riLog | Select-Object -First 1) | ConvertFrom-Json

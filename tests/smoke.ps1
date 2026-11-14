@@ -1,9 +1,10 @@
 # Smoke test: serves a named pipe from this script, mounts it with the mount tool
-# and checks reads, nested paths, rejected paths and unmount. Needs WinFsp
-# installed and pipe-file-mount-winfsp.exe built (see ..\build.ps1). Windows
+# and checks reads, nested paths, rejected paths and unmount. Needs the driver of -Backend
+# (winfsp or dokan) installed and pipe-file-mount-<backend>.exe built (see ..\build.ps1). Windows
 # PowerShell 5.1 or later; use a free drive letter.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\pipe-file-mount-winfsp.exe'),
+    [string]$Backend = 'winfsp',
+    [string]$Exe = (Join-Path $PSScriptRoot "..\pipe-file-mount-$Backend.exe"),
     [string]$Drive = 'K'
 )
 $ErrorActionPreference = 'Stop'
@@ -72,7 +73,7 @@ try {
 }
 finally {
     Stop-Job $server -ErrorAction SilentlyContinue; Remove-Job $server -Force -ErrorAction SilentlyContinue
-    Get-Process pipe-file-mount-winfsp -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process "pipe-file-mount-$Backend" -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 if ($script:failures) { "$script:failures check(s) failed"; exit 1 }
 'all checks passed'

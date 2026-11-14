@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include "pfs_backend.h"
 #include "dokan.h"
+#include "dokan_access.h"
 
 #define MAX_PATHW 1024
 #define DOKAN_REQUEST_TIMEOUT_MS (5 * 60 * 1000)   // the driver unmounts the volume when one request exceeds this; 5 minutes is its maximum
@@ -21,38 +22,6 @@ static BOOL g_folder_mount;
 static WCHAR g_dokan_dir[MAX_PATHW];   // development override (run mode only); empty = use the driver service and System32
 
 static void file_time(UINT64 t, FILETIME *ft) { ft->dwLowDateTime = (DWORD)t; ft->dwHighDateTime = (DWORD)(t >> 32); }
-
-// ---------------------------------------------------------------- access check
-
-// Dokan opens whatever the file system lets it open, so the per-file security descriptor is enforced
-// here, against the token of the process that issued the open. SYNCHRONIZE is implied; an open that
-// asks for nothing else (just a handle) is not checked.
-static NTSTATUS check_access(LPCWSTR name, ACCESS_MASK access, PDOKAN_FILE_INFO fi)
-{
-    GENERIC_MAPPING gm = { FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS };
-    ACCESS_MASK want = access & ~(ACCESS_MASK)SYNCHRONIZE;
-    MapGenericMask(&want, &gm);
-    if (!want) return STATUS_SUCCESS;
-
-    SIZE_T sdsz = 0; BOOL dir;
-    NTSTATUS st = pfs_stat(name, &dir, NULL, &sdsz);
-    if (!NT_SUCCESS(st)) return st;
-    PSECURITY_DESCRIPTOR sd = malloc(sdsz);
-    if (!sd) return STATUS_INSUFFICIENT_RESOURCES;
-    st = pfs_stat(name, &dir, sd, &sdsz);
-    if (!NT_SUCCESS(st)) { free(sd); return st; }
-
-    NTSTATUS result = STATUS_ACCESS_DENIED;
-    HANDLE tok = DokanOpenRequestorToken(fi), imp = NULL;
-    if (tok && DuplicateToken(tok, SecurityImpersonation, &imp)) {
-        PRIVILEGE_SET ps; DWORD psl = sizeof ps, got = 0; BOOL granted = FALSE;
-        if (AccessCheck(sd, imp, want, &gm, &ps, &psl, &got, &granted) && granted) result = STATUS_SUCCESS;
-    }
-    if (imp) CloseHandle(imp);
-    if (tok) CloseHandle(tok);
-    free(sd);
-    return result;
-}
 
 // ---------------------------------------------------------------- callbacks
 
@@ -71,7 +40,7 @@ static NTSTATUS DOKAN_CALLBACK ZwCreate(LPCWSTR name, PDOKAN_IO_SECURITY_CONTEXT
     if (disp != FILE_OPEN && disp != FILE_OPEN_IF) return STATUS_MEDIA_WRITE_PROTECTED;   // supersede / overwrite
     if (dir && (opts & FILE_NON_DIRECTORY_FILE)) return STATUS_FILE_IS_A_DIRECTORY;
     if (!dir && (opts & FILE_DIRECTORY_FILE)) return STATUS_NOT_A_DIRECTORY;
-    st = check_access(name, access, fi);
+    st = dokan_check_access(name, access, fi, pfs_stat);
     if (!NT_SUCCESS(st)) return st;
 
     Handle *h = (Handle *)calloc(1, sizeof *h);
@@ -138,7 +107,8 @@ static BOOL add_entry(void *ctx, const WCHAR *leaf, UINT64 id)
     wcscpy_s(d.cFileName, MAX_PATH, leaf);
     d.dwFileAttributes = FILE_ATTRIBUTE_READONLY;
     file_time(pfs_time(), &d.ftCreationTime); d.ftLastAccessTime = d.ftLastWriteTime = d.ftCreationTime;
-    return f->fill(&d, f->fi) != 0;
+    f->fill(&d, f->fi);   // Dokan's fill function always returns 0, whether or not the entry was taken
+    return TRUE;
 }
 
 static NTSTATUS DOKAN_CALLBACK Find(LPCWSTR name, PFillFindData fill, PDOKAN_FILE_INFO fi)
