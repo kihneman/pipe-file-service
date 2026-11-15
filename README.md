@@ -7,10 +7,12 @@
 Shows a Windows named pipe as a read-only file, so tools that only know how to open a file path can read a
 secret that another program serves over the pipe. The file sits on a small virtual volume provided by a
 user-mode file system driver, [WinFsp](https://github.com/winfsp/winfsp) or
-[Dokan](https://github.com/dokan-dev/dokany). The content is fetched from the pipe on the first read of each
-open handle and is never written to disk (the ProjFS service build is the exception, see [ProjFS](#projfs-the-service-only)).
+[Dokan](https://github.com/dokan-dev/dokany), or, in the ProjFS builds, in a folder projected by the Windows
+Projected File System (a Windows feature: no third-party driver). The content is fetched from the pipe on the
+first read of each open handle and, with WinFsp and Dokan, is never written to disk. **The ProjFS builds are
+the exception: they write the content to the projected folder while it is read** (see [ProjFS](#projfs)).
 
-There are two programs, each built once per driver (`-winfsp` and `-dokan`; see
+There are two programs, each built once per backend (`-winfsp`, `-dokan` and `-projfs`; see
 [Backends](#backends-winfsp-dokan-or-projfs)):
 
 - `pipe-file-mount-<driver>.exe` mounts one pipe as one file, in the process that runs it
@@ -28,7 +30,7 @@ protocol described below. The drivers are not included; install the one you use.
 pipe-file-mount.exe \\.\pipe\<name> <mountpoint> [path on the volume]
 ```
 
-(Built per driver as `pipe-file-mount-winfsp.exe` or `pipe-file-mount-dokan.exe`; the examples use the short name. See "Backends" below.)
+(Built per backend as `pipe-file-mount-winfsp.exe`, `pipe-file-mount-dokan.exe` or `pipe-file-mount-projfs.exe`; the examples use the short name and a drive letter, which ProjFS does not have: see "Backends" below.)
 
 Mounts drive `K:` (or `*` to pick a free letter) containing one file. The file
 is at `\property-file.env` unless you give a path, which may have any number of
@@ -68,7 +70,7 @@ pipe-file-mount.exe \\.\pipe\secrets K: \secrets\app\prod.env --reader-info-suff
 The mount tool then opens `\\.\pipe\secrets-reader` (the pipe name plus the suffix),
 and on the first read of every handle opened for data it sends the caller's PID
 and process creation time. The caller is taken at `Open` (WinFsp reports it only there,
-Dokan on every request), so the mount tool records them there (and keeps a handle on
+Dokan on every request, ProjFS in every placeholder and data request), so the mount tool records them there (and keeps a handle on
 the process so the PID cannot be reused) and sends them at the first read. The server answers for that caller.
 This is a request, not a hint: if the second pipe is missing or the server
 refuses, the first read fails (`STATUS_ACCESS_DENIED` when refused,
@@ -105,8 +107,9 @@ long-running service, on one volume of the file system driver, that any local us
 2. turn an empty placeholder file the app made into a symlink to that file. Only a
    privileged process may create file symlinks without Developer Mode.
 
-In this README `PipeFileService.exe` stands for `PipeFileService-winfsp.exe` or `PipeFileService-dokan.exe`, and
-`pipe-file-mount.exe` for `pipe-file-mount-winfsp.exe` or `pipe-file-mount-dokan.exe`.
+In this README `PipeFileService.exe` stands for `PipeFileService-winfsp.exe`, `PipeFileService-dokan.exe` or
+`PipeFileService-projfs.exe`, and `pipe-file-mount.exe` for `pipe-file-mount-winfsp.exe`, `pipe-file-mount-dokan.exe`
+or `pipe-file-mount-projfs.exe`.
 
 ```
 PipeFileService.exe install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [limits]   (elevated)
@@ -116,7 +119,7 @@ PipeFileService.exe run [--mount <...>] [--winfsp-dir <folder> | --dokan-dir <fo
 
 The default mount is `C:\ProgramData\PipeFileService\mount`. `--mount` names a folder that does not
 exist, or a drive letter; the service prepares the folder itself (WinFsp needs a mount folder that does
-not exist and Dokan one that exists and is empty, see [Backends](#backends-winfsp-dokan-or-projfs)). The service is `PipeFileService`, display name "Pipe File
+not exist, Dokan one that exists and is empty, and the ProjFS build empties and recreates it, see [Backends](#backends-winfsp-dokan-or-projfs)). The service is `PipeFileService`, display name "Pipe File
 Service", runs as LocalSystem with a minimal privilege list
 (`SeCreateSymbolicLinkPrivilege`, `SeImpersonatePrivilege`, `SeChangeNotifyPrivilege`)
 and is started on demand, or at every boot with `install --auto-start`. It writes
@@ -237,12 +240,13 @@ path later:
 
 ### Install
 
-The service needs its file system driver (WinFsp or Dokan, matching the exe) installed, but it is safe to
+The service needs its file system driver (WinFsp or Dokan, matching the exe; for the ProjFS build the Windows
+feature `Client-ProjFS`) installed, but it is safe to
 install the service on a machine that does not have the driver (for example from an app installer that
 fetches the driver later, only if the user agrees):
 
-- **At start, driver missing:** the service logs one line to `service.log` ("WinFsp is not installed" or
-  "Dokan is not installed"), opens **no control pipe**, and stops with exit code 0. The Service Control
+- **At start, driver missing:** the service logs one line to `service.log` ("WinFsp is not installed",
+  "Dokan is not installed" or "Windows Projected File System is not installed"), opens **no control pipe**, and stops with exit code 0. The Service Control
   Manager logs no failure and runs no recovery action. The start type is left alone, so with
   `install --auto-start` it tries again at every boot. Nothing polls and nothing listens while the driver
   is missing: **the control pipe does not exist until the driver is installed and the service is started.**
@@ -255,10 +259,11 @@ fetches the driver later, only if the user agrees):
 - "The driver is installed" means, for WinFsp: the registry `InstallDir` under
   `HKLM\SOFTWARE\WOW6432Node\WinFsp` has `bin\winfsp-x64.dll`, and a `WinFsp` file system
   driver service is registered (WinFsp 2.x names it `WinFsp+<timestamp>`). For Dokan: `dokan2.dll` is in the
-  system folder and the `Dokan2` file system driver service exists. The check loads no driver code.
+  system folder and the `Dokan2` file system driver service exists. For ProjFS: `projectedfslib.dll` is in the
+  system folder and the `PrjFlt` service exists. The check loads no driver code.
 - For tests, `run --winfsp-dir <folder>` (WinFsp build) makes the check look for
   `<folder>\bin\winfsp-x64.dll` instead, and `run --dokan-dir <folder>` (Dokan build) for
-  `<folder>\dokan2.dll`. They exist only in `run` mode.
+  `<folder>\dokan2.dll`. They exist only in `run` mode (the ProjFS build has no such option).
 
 ### Installing a driver silently (for an installer or app)
 
@@ -328,12 +333,24 @@ between.
 
 `tests\install-chain.ps1 -Backend dokan` runs the same sequence for Dokan.
 
+#### ProjFS
+
+ProjFS is part of Windows; there is no installer to ship. Enable the optional feature (elevated):
+
+```powershell
+Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart
+```
+
+It takes effect at once on Windows 11 (no restart was needed; the result's `RestartNeeded` says so). Afterwards
+check that `C:\Windows\System32\projectedfslib.dll` exists and that `sc query PrjFlt` shows the filter driver
+running. Then `sc start PipeFileService`. Removing the feature again was not tested.
+
 #### Both
 
 The service does not use a restricted service SID: that makes the token write-restricted and it then
 cannot create its folder or reopen a user's placeholder.
 
-Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated and take `-Backend winfsp|dokan`;
+Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated and take `-Backend winfsp|dokan|projfs`;
 `tests\service-smoke.ps1` runs as an ordinary user, the realistic caller):
 
 ```powershell
@@ -342,12 +359,13 @@ Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated and take
 .\tests\service-down.ps1      # elevated: stop + uninstall + check nothing is left
 ```
 
-`tests\limits.ps1` (unelevated, service running) checks the control-pipe limits. `tests\slow-read.ps1`
+`tests\declared-size.ps1` (unelevated, service running) checks the optional `size` of `register`, and
+`tests\projfs.ps1` what is specific to the ProjFS service. `tests\limits.ps1` (unelevated, service running) checks the control-pipe limits. `tests\slow-read.ps1`
 (unelevated, service running) checks that a read waiting 20 seconds for the data server succeeds and the
 volume stays mounted.
 `tests\exit-codes.ps1` checks that the test scripts end with an explicit `exit`, so a passing run
 reports exit code 0 even when started with `&` or from a CI step.
-`tests\driver-missing.ps1 -Backend winfsp|dokan` checks the driver-missing behaviour with `--winfsp-dir` or
+`tests\driver-missing.ps1 -Backend winfsp|dokan` (not yet for ProjFS) checks the driver-missing behaviour with `--winfsp-dir` or
 `--dokan-dir` (the first part runs unelevated; the rest needs an elevated shell and no running
 service). `tests\install-chain.ps1 -Backend winfsp|dokan -DriverInstaller <msi>` is for a clean VM (elevated):
 service installed before the driver, driver installed silently, driver removed again; `-RemoveExisting`
@@ -372,22 +390,23 @@ and the SDK of each driver you build for:
 `get-winfsp-sdk.ps1` downloads a pinned WinFsp release MSI, checks its SHA-256 and
 extracts it without installing anything. The programs link the C runtime
 statically (no Visual C++ redistributable) and load their driver's DLL
-(`winfsp-x64.dll` or `dokan2.dll`) at run time, printing "WinFsp is not installed" or
-"Dokan is not installed" if it is missing. `--version` works without the driver.
+(`winfsp-x64.dll`, `dokan2.dll` or `projectedfslib.dll`) at run time, printing "WinFsp is not installed",
+"Dokan is not installed" or a line about enabling `Client-ProjFS` if it is missing. `--version` works without the driver.
 
 Each service exe is built from two parts: `src\pfs_core.c` (control pipe, registrations, limits,
 placeholder links, fetch on first read, service install) and one file system driver backend
-(`src\pfs_backend_winfsp.c` or `src\pfs_backend_dokan.c`), joined by the interface in
+(`src\pfs_backend_winfsp.c`, `src\pfs_backend_dokan.c` or `src\pfs_backend_projfs.c`), joined by the interface in
 `src\pfs_backend.h`. The mount tool has the same shape (`src\pfm_core.c`, `src\pfm_backend_*.c`,
 `src\pfm_backend.h`). A build links exactly one backend, so each exe references exactly one driver.
 
 ### Backends: WinFsp, Dokan or ProjFS
 
-`build.ps1 -Backend winfsp|dokan|all` builds `PipeFileService-winfsp.exe` and/or `PipeFileService-dokan.exe`
-(and `pipe-file-mount-winfsp.exe` / `pipe-file-mount-dokan.exe`). The two services behave the same: same service name
+`build.ps1 -Backend winfsp|dokan|projfs|all` builds `PipeFileService-winfsp.exe`, `PipeFileService-dokan.exe` and/or
+`PipeFileService-projfs.exe` (and `pipe-file-mount-winfsp.exe`, `pipe-file-mount-dokan.exe`, `pipe-file-mount-projfs.exe`).
+The WinFsp and Dokan services behave the same (ProjFS differs, see below): same service name
 (`PipeFileService`), same control pipe, same protocol, same file names. Only the driver differs, and each exe
-references exactly one: the WinFsp build does not mention Dokan and the other way round, and both delay-load
-their driver's DLL. Install whichever driver you ship; `install` and `uninstall` work the same.
+references exactly one: the WinFsp build does not mention Dokan or ProjFS and so on, and each delay-loads
+its driver's DLL. Install whichever driver you ship; `install` and `uninstall` work the same.
 
 The Dokan backend (Dokany 2.x) differs where the driver does:
 
@@ -408,9 +427,9 @@ The Dokan `pipe-file-mount` takes the same arguments. A drive letter works as wi
 `scripts\get-dokan-sdk.ps1` fetches the Dokan headers and import library (every download checked against a
 pinned SHA-256) without installing the driver.
 
-#### ProjFS (the service only)
+#### ProjFS
 
-`build.ps1 -Backend projfs` builds `PipeFileService-projfs.exe`. It uses the Windows Projected File System, an
+`build.ps1 -Backend projfs` builds `PipeFileService-projfs.exe` and `pipe-file-mount-projfs.exe`. They use the Windows Projected File System, an
 optional Windows feature (`Client-ProjFS`) with Microsoft's own library and filter driver: there is no third-party
 driver to install or license. Enable it with `Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
 -NoRestart` (elevated; no restart was needed on Windows 11). It is a different kind of file system from the other
@@ -421,6 +440,8 @@ two, and **it does not keep their guarantee that the secret is never written to 
   asks the data server again, but a reader that opens the file while it is still there gets the data from the
   disk without a request to the data server (in a test with two readers, about one read in five), and if the
   service crashes, the file stays on disk until the next start (the service empties the folder at every start).
+  With several readers at once, an open that lands while the previous reader's file is being removed can fail once
+  with a sharing violation (about one read in a hundred in a stress test); retrying the open works.
 - The files take the access control of the folder: SYSTEM full control and authenticated users read. The
   registering user's permission is checked, against the process that made the request, only when ProjFS asks the
   service for the placeholder or the data; a file that is already on disk is served by NTFS to anyone the folder's
@@ -430,9 +451,26 @@ two, and **it does not keep their guarantee that the secret is never written to 
 - The size of the file must be known before the first read, so `register` **requires `size`** in this build and
   answers `size_required` without it.
 - `--mount` must name a folder (the default is fine), not a drive letter. The service deletes whatever is in the
-  folder at start and removes the folder at stop. There is no ProjFS `pipe-file-mount`.
+  folder at start and removes the folder at stop.
 - The driver check is that `projectedfslib.dll` is in the system folder and the `PrjFlt` service exists.
   `tests\projfs.ps1` covers what is specific to this build.
+
+`pipe-file-mount-projfs.exe` takes the same arguments as the other mount tools, with three differences:
+
+- The mount point is a folder, not a drive letter or `*`. The folder must not exist or must be empty (a folder a
+  killed run left behind is cleaned; anything else that is not empty is refused and left alone). The tool
+  removes it when it stops, or puts an empty folder back if one was there.
+- `--size <bytes>` is required (0 to 1073741824): the file reports it from the start and a read of any other
+  length fails.
+- The folder allows only the user who started the tool, and SYSTEM; the files inherit that, and it is the user's
+  own folder, so the user can also create other files in it (they are removed at stop). Reads, writes, deletes
+  and renames of the served file behave as for the service.
+
+```
+pipe-file-mount-projfs.exe \\.\pipe\secrets C:\work\secrets \app\prod.env --size 1234
+```
+
+`tests\projfs-mount.ps1` covers it (no administrator rights needed).
 
 ## Releases
 
@@ -469,7 +507,7 @@ sha256sum -c SHA256SUMS
 `tests\smoke.ps1` serves a pipe from the script itself, mounts it, and checks
 reads, nested and default paths, case-insensitive lookup, rejected paths, refused
 writes and unmount. It needs the driver of `-Backend` (`winfsp`, the default, or `dokan`), a built `pipe-file-mount-<backend>.exe` and a free
-drive letter (default `K`):
+drive letter (default `K`). The ProjFS mount tool has no drive letter; `tests\projfs-mount.ps1` covers it:
 
 ```powershell
 .\tests\smoke.ps1
@@ -481,7 +519,8 @@ drive letter (default `K`):
 - WinFsp reports the caller's PID and image path in `Open` only; `Read` sees
   PID 0. Dokan reports it on every request (cleanup and close can show pid 4, System, so only the
   open is used). Both programs therefore record the caller in `Open` and use it at the
-  first `Read`.
+  first `Read`. ProjFS reports the triggering process in every placeholder and data request, and the ProjFS
+  backend uses it for the data request.
 - Programs open a file several times with attribute-only access (0x80) before the
   data open, and some open with read access (for example 0x00120089, a plain
   read open) and close without reading. Fetching at the first read keeps those

@@ -4,7 +4,7 @@
 # Each backend gives its own pair of programs, so a shipped exe references exactly one driver:
 #   -Backend winfsp  PipeFileService-winfsp.exe, pipe-file-mount-winfsp.exe
 #   -Backend dokan   PipeFileService-dokan.exe, pipe-file-mount-dokan.exe
-#   -Backend projfs  PipeFileService-projfs.exe (service only; the Windows Projected File System, no driver)
+#   -Backend projfs  PipeFileService-projfs.exe, pipe-file-mount-projfs.exe (the Windows Projected File System, no driver)
 #   -Backend all     every backend
 #
 # -WinFsp must point at a folder containing inc\winfsp\winfsp.h and
@@ -54,6 +54,7 @@ if ($buildWinFsp) {
     Invoke-Cl 'PipeFileService-winfsp.exe' 'build\winfsp' @('src\pfs_core.c', 'src\pfs_backend_winfsp.c') "$WinFsp\inc" "$WinFsp\lib\winfsp-x64.lib" 'winfsp-x64.dll'
 }
 if ($buildProjFS) {   # ProjFS is part of Windows: the import library comes with the Windows SDK, no driver SDK to fetch
+    Invoke-Cl 'pipe-file-mount-projfs.exe' 'build\projfs-mount' @('src\pfm_core.c', 'src\pfm_backend_projfs.c') '.' 'ProjectedFSLib.lib' 'projectedfslib.dll'
     Invoke-Cl 'PipeFileService-projfs.exe' 'build\projfs' @('src\pfs_core.c', 'src\pfs_backend_projfs.c') '.' 'ProjectedFSLib.lib' 'projectedfslib.dll'
 }
 if ($buildDokan) {
