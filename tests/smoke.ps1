@@ -8,7 +8,7 @@ param(
     [string]$Drive = 'K'
 )
 $ErrorActionPreference = 'Stop'
-$env:PATH = "C:\Program Files (x86)\WinFsp\bin;$env:PATH"
+if ($Backend -eq 'winfsp') { $env:PATH = "C:\Program Files (x86)\WinFsp\bin;$env:PATH" }   # the WinFsp DLL; Dokan's is in the system folder
 $pipeName = "pipe-file-mount-smoke-$PID"
 $content = "# smoke`nKEY=value`nQUOTED=`"a \`"b\`" c`"`n"
 $script:failures = 0

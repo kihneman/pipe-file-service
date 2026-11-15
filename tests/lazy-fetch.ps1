@@ -8,7 +8,7 @@ param(
     [string]$Drive = 'K'
 )
 $ErrorActionPreference = 'Stop'
-$env:PATH = "C:\Program Files (x86)\WinFsp\bin;$env:PATH"
+if ($Backend -eq 'winfsp') { $env:PATH = "C:\Program Files (x86)\WinFsp\bin;$env:PATH" }   # the WinFsp DLL; Dokan's is in the system folder
 $work = Join-Path $env:TEMP "lazy-fetch-$PID"
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $work | Out-Null

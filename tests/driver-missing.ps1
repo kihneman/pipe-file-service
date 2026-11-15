@@ -4,7 +4,7 @@
 #
 #   missing at start-up   exit code 0, a log line, no control pipe        (runs unelevated)
 #   gone at register      `register` answers driver_not_installed          (needs an ELEVATED shell and the
-#   present at start-up   the control pipe exists and registration works    real WinFsp: it really mounts a volume)
+#   present at start-up   the control pipe exists and registration works    real driver: it really mounts a volume)
 #
 # Run it from Windows PowerShell 5.1. -Exe selects the binary (the mutation check passes a broken build).
 param([string]$Backend = 'winfsp', [string]$Exe = (Join-Path $PSScriptRoot "..\PipeFileService-$Backend.exe"))
