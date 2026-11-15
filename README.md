@@ -421,6 +421,8 @@ two, and **it does not keep their guarantee that the secret is never written to 
   asks the data server again, but a reader that opens the file while it is still there gets the data from the
   disk without a request to the data server (in a test with two readers, about one read in five), and if the
   service crashes, the file stays on disk until the next start (the service empties the folder at every start).
+  With several readers at once, an open that lands while the previous reader's file is being removed can fail once
+  with a sharing violation (about one read in a hundred in a stress test); retrying the open works.
 - The files take the access control of the folder: SYSTEM full control and authenticated users read. The
   registering user's permission is checked, against the process that made the request, only when ProjFS asks the
   service for the placeholder or the data; a file that is already on disk is served by NTFS to anyone the folder's
