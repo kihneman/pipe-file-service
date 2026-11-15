@@ -39,9 +39,14 @@ jobs:
           $out = ./pipe-file-mount-winfsp.exe --version
           if ($LASTEXITCODE -ne 0 -or $out -notmatch '^pipe-file-mount \d') { throw "unexpected output: $out" }
           $out
-          foreach ($b in 'winfsp', 'dokan') {
+          foreach ($b in 'winfsp', 'dokan', 'projfs') {
             $out = & "./PipeFileService-$b.exe" --version
             if ($LASTEXITCODE -ne 0 -or $out -notmatch '^PipeFileService \d') { throw "unexpected output: $out" }
+            $out
+          }
+          foreach ($b in 'dokan', 'projfs') {
+            $out = & "./pipe-file-mount-$b.exe" --version
+            if ($LASTEXITCODE -ne 0 -or $out -notmatch '^pipe-file-mount \d') { throw "unexpected output: $out" }
             $out
           }
 

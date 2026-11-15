@@ -20,6 +20,7 @@
 #define CHUNK (1u << 20)   // bytes written to ProjFS per call (a multiple of any sector size)
 
 static WCHAR g_root[MAX_PATHW];
+static WCHAR g_projfs_dir[MAX_PATHW];   // development override (run mode only); empty = the real system folder
 static PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT g_ctx;
 
 // "name" (ProjFS path, no leading backslash) -> "\name" (the core's path). FALSE for anything but a top-level name.
@@ -169,7 +170,25 @@ static HRESULT CALLBACK Notify(const PRJ_CALLBACK_DATA *d, BOOLEAN dir, PRJ_NOTI
 
 // ---------------------------------------------------------------- serving
 
-static BOOL installed(void) { return projfs_installed(); }
+static BOOL installed(void) { return projfs_installed(g_projfs_dir); }
+
+// `--projfs-dir <folder>`: never read in service mode.
+static BOOL parse_run_option(const WCHAR *flag, const WCHAR *value)
+{
+    if (0 != wcscmp(flag, L"--projfs-dir") || !value[0]) return FALSE;
+    wcscpy_s(g_projfs_dir, MAX_PATHW, value);
+    return TRUE;
+}
+
+static BOOL running_as_system(void)
+{
+    HANDLE tok; BYTE buf[256]; DWORD n = 0; BYTE sys[SECURITY_MAX_SID_SIZE]; DWORD sn = sizeof sys; BOOL yes = FALSE;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return FALSE;
+    if (GetTokenInformation(tok, TokenUser, buf, sizeof buf, &n) && CreateWellKnownSid(WinLocalSystemSid, NULL, sys, &sn))
+        yes = EqualSid(((TOKEN_USER *)buf)->User.Sid, sys);
+    CloseHandle(tok);
+    return yes;
+}
 
 static int start(const WCHAR *mount)
 {
@@ -177,11 +196,15 @@ static int start(const WCHAR *mount)
     wcscpy_s(g_root, MAX_PATHW, mount);
     InitializeCriticalSection(&g_enum_lock);
 
+    // No owner in the descriptor: the creator owns the folder (naming another owner needs a privilege that `run` in an
+    // elevated console does not have).
     // Start from an empty folder we own: whatever a previous run left (hydrated files, a stale ProjFS root) is removed.
     projfs_make_parents(mount);
     projfs_remove_tree(mount, TRUE);
     PSECURITY_DESCRIPTOR sd = NULL;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;AU)", SDDL_REVISION_1, &sd, NULL)) {
+    // The service is SYSTEM, which the descriptor names already. Only a development `run` as another account adds OWNER RIGHTS.
+    const WCHAR *sddl = running_as_system() ? L"D:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;AU)" : L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)(A;OICI;FRFX;;;AU)";
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, NULL)) {
         pfs_log("cannot build the folder security descriptor: %lu", GetLastError()); return 12;
     }
     SECURITY_ATTRIBUTES sa = { sizeof sa, sd, FALSE };
@@ -217,6 +240,8 @@ static void stop(void)
 
 const PfsBackend pfs_backend = {
     L"Windows Projected File System", "https://learn.microsoft.com/windows/win32/projfs/projected-file-system (enable the Windows feature Client-ProjFS)",
-    installed, start, stop, NULL, NULL, NULL,
+    installed, start, stop, parse_run_option,
+    L"--projfs-dir <folder>",
+    L"--projfs-dir makes the ProjFS check look for <folder>\\projectedfslib.dll instead of the real install",
     TRUE,   // requires_size
 };

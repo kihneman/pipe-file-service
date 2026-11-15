@@ -114,7 +114,7 @@ or `pipe-file-mount-projfs.exe`.
 ```
 PipeFileService.exe install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [limits]   (elevated)
 PipeFileService.exe uninstall                                                                                  (elevated)
-PipeFileService.exe run [--mount <...>] [--winfsp-dir <folder> | --dokan-dir <folder>] [limits]    run in this console (elevated), for development
+PipeFileService.exe run [--mount <...>] [--winfsp-dir <folder> | --dokan-dir <folder> | --projfs-dir <folder>] [limits]    run in this console (elevated), for development
 ```
 
 The default mount is `C:\ProgramData\PipeFileService\mount`. `--mount` names a folder that does not
@@ -263,7 +263,8 @@ fetches the driver later, only if the user agrees):
   system folder and the `PrjFlt` service exists. The check loads no driver code.
 - For tests, `run --winfsp-dir <folder>` (WinFsp build) makes the check look for
   `<folder>\bin\winfsp-x64.dll` instead, and `run --dokan-dir <folder>` (Dokan build) for
-  `<folder>\dokan2.dll`. They exist only in `run` mode (the ProjFS build has no such option).
+  `<folder>\dokan2.dll`, and `run --projfs-dir <folder>` (ProjFS build) for `<folder>\projectedfslib.dll`.
+  They exist only in `run` mode.
 
 ### Installing a driver silently (for an installer or app)
 
@@ -365,8 +366,8 @@ Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated and take
 volume stays mounted.
 `tests\exit-codes.ps1` checks that the test scripts end with an explicit `exit`, so a passing run
 reports exit code 0 even when started with `&` or from a CI step.
-`tests\driver-missing.ps1 -Backend winfsp|dokan` (not yet for ProjFS) checks the driver-missing behaviour with `--winfsp-dir` or
-`--dokan-dir` (the first part runs unelevated; the rest needs an elevated shell and no running
+`tests\driver-missing.ps1 -Backend winfsp|dokan|projfs` checks the driver-missing behaviour with `--winfsp-dir`,
+`--dokan-dir` or `--projfs-dir` (the first part runs unelevated; the rest needs an elevated shell and no running
 service). `tests\install-chain.ps1 -Backend winfsp|dokan -DriverInstaller <msi>` is for a clean VM (elevated):
 service installed before the driver, driver installed silently, driver removed again; `-RemoveExisting`
 uninstalls a driver that is already installed first (Dokan then needs a restart before it can be installed
@@ -482,12 +483,12 @@ Releases are built by GitHub Actions when a tag is pushed. The tag must match
 git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1
 ```
 
-The workflow attaches one zip per driver
-(`pipe-file-service-<version>-winfsp-windows-x64.zip` and `...-dokan-windows-x64.zip`, each with its two
-exes, `LICENSE` and `README.md`) and one `SHA256SUMS` for both. The release notes list the SHA-256 of every
+The workflow attaches one zip per backend
+(`pipe-file-service-<version>-winfsp-windows-x64.zip`, `...-dokan-windows-x64.zip` and
+`...-projfs-windows-x64.zip`, each with its two exes, `LICENSE` and `README.md`) and one `SHA256SUMS` for all three. The release notes list the SHA-256 of every
 exe. `.\scripts\release.ps1 -Tag v0.1.0-rc.1` builds the same files into `dist\`
-locally (it needs both SDKs). The binaries are not Authenticode-signed (Windows SmartScreen may warn),
-and neither driver is bundled.
+locally (it needs the WinFsp and Dokan SDKs; ProjFS needs none). The binaries are not Authenticode-signed
+(Windows SmartScreen may warn), and no driver is bundled.
 
 ### Verifying a release
 
@@ -497,8 +498,8 @@ which proves they were built by this repository's release workflow from the
 tagged commit (releases before v0.1.2 have none):
 
 ```
-gh attestation verify pipe-file-service-<version>-<winfsp|dokan>-windows-x64.zip -R kihneman/pipe-file-service
-gh attestation verify PipeFileService-<winfsp|dokan>.exe -R kihneman/pipe-file-service   # an exe taken out of the zip
+gh attestation verify pipe-file-service-<version>-<winfsp|dokan|projfs>-windows-x64.zip -R kihneman/pipe-file-service
+gh attestation verify PipeFileService-<winfsp|dokan|projfs>.exe -R kihneman/pipe-file-service   # an exe taken out of the zip
 sha256sum -c SHA256SUMS
 ```
 

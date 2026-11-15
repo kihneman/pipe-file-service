@@ -85,9 +85,13 @@ static const PRJ_NOTIFY_TYPES PROJFS_NOTIFY_MASK = (PRJ_NOTIFY_TYPES)(PRJ_NOTIFY
 
 // True when the Windows feature Client-ProjFS is on: projectedfslib.dll is in the system directory and the PrjFlt
 // filter driver service exists. Loads no ProjFS code.
-static BOOL projfs_installed(void)
+static BOOL projfs_installed(const WCHAR *dir_override)
 {
     WCHAR sys[MAX_PATH], path[MAX_PATHW];
+    if (dir_override && dir_override[0]) {   // development only (run mode): look for the library in this folder instead
+        swprintf_s(path, MAX_PATHW, L"%ls\\projectedfslib.dll", dir_override);
+        return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+    }
     if (!GetSystemDirectoryW(sys, MAX_PATH)) return FALSE;
     swprintf_s(path, MAX_PATHW, L"%ls\\projectedfslib.dll", sys);
     if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return FALSE;

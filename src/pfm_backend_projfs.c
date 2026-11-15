@@ -176,7 +176,7 @@ static HRESULT CALLBACK Notify(const PRJ_CALLBACK_DATA *d, BOOLEAN dir, PRJ_NOTI
 
 // ---------------------------------------------------------------- serving
 
-static BOOL load(void) { return projfs_installed(); }
+static BOOL load(void) { return projfs_installed(NULL); }
 
 // SDDL: SYSTEM and the user who started the program, nobody else. The user needs full control of every projected
 // folder because this program, running as the user, creates the placeholders inside them; the files are still
