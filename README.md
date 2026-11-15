@@ -168,10 +168,17 @@ Requests (all may carry a numeric `id`, which is echoed in the reply):
 
 | `type` | fields |
 | --- | --- |
-| `register` | `pipe` (full pipe name), `file_name`, optional `reader_info_suffix`, optional `link_path` |
+| `register` | `pipe` (full pipe name), `file_name`, optional `reader_info_suffix`, optional `link_path`, optional `size` |
 | `unregister` | `pipe` |
 
 Replies have `"type":"reply"` and `"status":"ok"` or `"error"`. On success
+`size` declares the length of the content in bytes (a whole number from 0 to 1073741824). With it the file
+reports that size from the start, so a program that trusts the reported size works, and stat and listing still
+never fetch. The content must then be exactly that long: if the server sends a different number of bytes the read
+fails with an I/O error (nothing partial is returned) and an `error` event with `message` `size_mismatch` is
+pushed. Without `size` the size is 0 until a handle has read, as before. A bad value is refused with
+`bad_request`. The size applies to the registration; to change it, unregister and register again.
+
 `register` returns `path` (the file inside the mount) and `linked`. Errors carry
 `code` (`bad_request`, `bad_name`, `pipe_unreachable`, `name_in_use`, `link_refused`,
 `not_found`, `driver_not_installed`, `too_many_registrations`) and a `message`. The service pushes events, `"type":"event"`, with
@@ -465,7 +472,7 @@ drive letter (default `K`):
   open of the file at all in that run (Explorer's details pane and an Electron
   Save dialog were not measured; they were seen to open the file with read access
   before this change).
-- The size is 0 until a handle has fetched (it is then the real length on that
+- Unless the registration declared a `size`, the size is 0 until a handle has fetched (it is then the real length on that
   handle). Readers that read to end of file are fine, but a program that trusts
   the reported size and never reads sees an empty file; `Copy-Item` (CopyFile) is
   one, so copy by reading (`Get-Content`, a stream) instead.
