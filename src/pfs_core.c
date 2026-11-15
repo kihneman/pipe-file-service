@@ -29,12 +29,13 @@
 // Limits on the control pipe, which every interactive user can open. The defaults can be changed with
 // `install --max-...` (kept in the service's Parameters key) or `run --max-...`; see usage().
 typedef struct { const WCHAR *flag, *value; int def, hi; int cur; BOOL set; } Limit;
-enum { LIM_REG_CONN, LIM_REG_USER, LIM_CONNS, LIM_CONNS_USER, LIM_COUNT };
+enum { LIM_REG_CONN, LIM_REG_USER, LIM_CONNS, LIM_CONNS_USER, LIM_IDLE, LIM_COUNT };
 static Limit g_limits[LIM_COUNT] = {
     { L"--max-reg-per-conn", L"MaxRegPerConn", 64, 10000, 64, FALSE },
     { L"--max-reg-per-user", L"MaxRegPerUser", 256, 100000, 256, FALSE },
     { L"--max-conn", L"MaxConn", 128, 10000, 128, FALSE },
     { L"--max-conn-per-user", L"MaxConnPerUser", 16, 10000, 16, FALSE },
+    { L"--idle-seconds", L"IdleSeconds", 30, 86400, 30, FALSE },   // not a limit: how long nothing is mounted-and-unused before it is unmounted
 };
 #define LIM(i) (g_limits[i].cur)
 
@@ -60,6 +61,7 @@ typedef struct Entry {
     WCHAR pipe[MAX_PIPE + 1];          // the data pipe
     WCHAR info_pipe[MAX_PIPE + MAX_SUFFIX + 1]; // pipe + suffix; empty = read the data pipe directly
     BOOL has_size; UINT64 size;        // the size the registrant declared; the content must be exactly this long
+    BOOL defer_pending;                // registered with defer while nothing was mounted: send "mounted" when it is
     PSECURITY_DESCRIPTOR sd; SIZE_T sdsz;
     Conn *conn;
     HANDLE link;                       // handle on the symlink this entry made, or NULL
@@ -80,6 +82,10 @@ static Entry *g_entries;
 static Conn *g_conns;
 static UINT64 g_next_id = 2;
 static HANDLE g_stop;
+static CRITICAL_SECTION g_mount_lock;   // serializes the backend's start and stop; taken before g_lock, never inside it
+static BOOL g_mounted;                  // the backend is started (the volume or folder exists)
+static volatile LONG g_open_handles;    // open handles on the served files; the volume is not unmounted under them
+static HANDLE g_wake;                   // wakes the mount thread early (a deferred registration, retry_mount)
 static UINT64 g_now;
 static WCHAR g_mount[MAX_PATHW];
 
@@ -242,8 +248,8 @@ static void send_event(Conn *c, const char *event, const WCHAR *file, UINT32 pid
     conn_send(c, &m);
 }
 
-static void send_reply(Conn *c, const WCHAR *id, const char *status, const char *code, const char *message,
-    const WCHAR *path, int linked)
+static void send_reply_x(Conn *c, const WCHAR *id, const char *status, const char *code, const char *message,
+    const WCHAR *path, int linked, int mounted)
 {
     Msg m; mstart(&m, "reply");
     if (id) { BOOL digits = id[0] != 0 && wcslen(id) < 20; for (const WCHAR *q = id; *q; q++) if (*q < L'0' || *q > L'9') digits = FALSE;
@@ -253,7 +259,14 @@ static void send_reply(Conn *c, const WCHAR *id, const char *status, const char 
     if (message) mstra(&m, "message", message);
     if (path) mstr(&m, "path", path);
     if (linked >= 0) mbool(&m, "linked", linked);
+    if (mounted >= 0) mbool(&m, "mounted", mounted);
     conn_send(c, &m);
+}
+
+static void send_reply(Conn *c, const WCHAR *id, const char *status, const char *code, const char *message,
+    const WCHAR *path, int linked)
+{
+    send_reply_x(c, id, status, code, message, path, linked, -1);
 }
 
 // ---------------------------------------------------------------- names
@@ -529,7 +542,7 @@ static NTSTATUS ensure_data(Ctx *c)
 NTSTATUS pfs_open(const WCHAR *name, UINT32 access, UINT32 pid, void **pfile, PfsInfo *info)
 {
     Ctx *c = (Ctx *)calloc(1, sizeof *c);
-    if (0 == wcscmp(name, L"\\")) { c->root = TRUE; c->id = 1; fill_info(c, info); *pfile = c; return STATUS_SUCCESS; }
+    if (0 == wcscmp(name, L"\\")) { c->root = TRUE; c->id = 1; fill_info(c, info); *pfile = c; InterlockedIncrement(&g_open_handles); return STATUS_SUCCESS; }
 
     WCHAR fname[MAX_NAME + 1], pipe[MAX_PIPE + 1], infop[MAX_PIPE + MAX_SUFFIX + 1];
     Conn *conn = NULL;
@@ -569,12 +582,14 @@ NTSTATUS pfs_open(const WCHAR *name, UINT32 access, UINT32 pid, void **pfile, Pf
     }
     fill_info(c, info);
     *pfile = c;
+    InterlockedIncrement(&g_open_handles);
     return STATUS_SUCCESS;
 }
 
 void pfs_close(void *file)
 {
     Ctx *c = (Ctx *)file;
+    InterlockedDecrement(&g_open_handles);
     if (c->data) { SecureZeroMemory(c->data, c->len); free(c->data); }
     if (c->proc) CloseHandle(c->proc);
     if (c->conn) conn_unref(c->conn);
@@ -739,6 +754,100 @@ static void remove_entry_locked(Entry *e)   // g_lock held
     free(e);
 }
 
+// ---------------------------------------------------------------- mounting on demand
+
+// The backend (the volume, or the projected folder) is started when the first registration needs it and stopped when
+// nothing has used it for --idle-seconds: no registrations and no open handle. The control pipe stays up the whole time, so
+// a client never has to wait for the service to start. Returns 0, 1 (the driver is not installed) or 2 (the backend
+// failed to start; it logged why).
+#define MOUNT_NOT_INSTALLED 1
+#define MOUNT_FAILED 2
+static int mount_now(void)
+{
+    int rc = 0;
+    EnterCriticalSection(&g_mount_lock);
+    if (!g_mounted) {
+        if (!pfs_backend.installed()) rc = MOUNT_NOT_INSTALLED;
+        else if (pfs_backend.start(g_mount)) { logf_("could not mount on %ls", g_mount); rc = MOUNT_FAILED; }
+        else { g_mounted = TRUE; logf_("mounted on %ls", g_mount); }
+    }
+    LeaveCriticalSection(&g_mount_lock);
+    return rc;
+}
+
+static void unmount_now(void)
+{
+    EnterCriticalSection(&g_mount_lock);
+    if (g_mounted) { pfs_backend.stop(); g_mounted = FALSE; logf_("unmounted"); }
+    LeaveCriticalSection(&g_mount_lock);
+}
+
+// Handles open on the served files: the core's own, and the backend's (ProjFS opens are not seen by the core).
+static LONG open_handles(void)
+{
+    LONG n = g_open_handles;
+    if (pfs_backend.open_handles) n += pfs_backend.open_handles();
+    return n;
+}
+
+static int count_entries(void)
+{
+    int n = 0;
+    EnterCriticalSection(&g_lock);
+    for (Entry *e = g_entries; e; e = e->next) n++;
+    LeaveCriticalSection(&g_lock);
+    return n;
+}
+
+// The re-check and the stop happen under the mount lock, and a registration mounts again under it after adding its
+// entry, so a registration that arrives while this runs is mounted for as soon as the stop is done.
+static void unmount_if_idle(void)
+{
+    EnterCriticalSection(&g_mount_lock);
+    if (g_mounted && count_entries() == 0 && open_handles() == 0) { pfs_backend.stop(); g_mounted = FALSE; logf_("unmounted (idle)"); }
+    LeaveCriticalSection(&g_mount_lock);
+}
+
+// Tells the clients whose deferred registrations were waiting for the mount that it exists now.
+static void announce_mounted(void)
+{
+    struct { Conn *c; WCHAR name[MAX_NAME + 1]; } todo[64];
+    int n = 0;
+    EnterCriticalSection(&g_lock);
+    for (Entry *e = g_entries; e && n < 64; e = e->next) {
+        if (!e->defer_pending) continue;
+        e->defer_pending = FALSE;
+        todo[n].c = e->conn; InterlockedIncrement(&e->conn->refs);
+        wcscpy_s(todo[n].name, MAX_NAME + 1, e->name);
+        n++;
+    }
+    LeaveCriticalSection(&g_lock);
+    for (int i = 0; i < n; i++) { send_event(todo[i].c, "mounted", todo[i].name, 0, NULL); conn_unref(todo[i].c); }
+}
+
+static DWORD WINAPI mount_thread(LPVOID arg)
+{
+    (void)arg;
+    DWORD idle_since = 0, next_try = 0;
+    HANDLE w[2] = { g_stop, g_wake };
+    while (WaitForMultipleObjects(2, w, FALSE, 1000) != WAIT_OBJECT_0) {
+        int n = count_entries();
+        if (n > 0 && !g_mounted) {   // registrations are waiting for the driver (or for a failed mount to be retried)
+            if (GetTickCount() >= next_try) {
+                int rc = mount_now();
+                if (rc == MOUNT_FAILED) next_try = GetTickCount() + 5000;
+                if (rc == 0) announce_mounted();
+            }
+            idle_since = 0;
+        } else if (n == 0 && g_mounted && open_handles() == 0) {
+            DWORD now = GetTickCount();
+            if (!idle_since) idle_since = now;
+            else if (now - idle_since >= (DWORD)LIM(LIM_IDLE) * 1000) { unmount_if_idle(); idle_since = 0; }
+        } else idle_since = 0;
+    }
+    return 0;
+}
+
 static BOOL probe_pipe(Conn *c, const WCHAR *name, DWORD access, DWORD *err)
 {
     if (!ImpersonateNamedPipeClient(c->pipe)) { *err = GetLastError(); return FALSE; }
@@ -757,8 +866,13 @@ static void do_register(Conn *c, const Json *j, const WCHAR *id)
     WCHAR name[MAX_NAME + 1];
     const char *why = build_volume_name(pipe, file, name);
     if (why) { send_reply(c, id, "error", "bad_name", why, NULL, -1); return; }
+    // `defer`: accept the registration even when the driver is not installed (or the mount fails) and mount when it can.
+    const WCHAR *defer_text = jget(j, L"defer");
+    BOOL defer = FALSE;
+    if (defer_text && 0 == wcscmp(defer_text, L"true")) defer = TRUE;
+    else if (defer_text && 0 != wcscmp(defer_text, L"false")) { send_reply(c, id, "error", "bad_request", "defer must be true or false", NULL, -1); return; }
     // The driver can be removed while the service runs: existing registrations are left alone (they fail by themselves).
-    if (!pfs_backend.installed()) {
+    if (!defer && !pfs_backend.installed()) {
         char m[128]; snprintf(m, sizeof m, "%ls is not installed; install it and try again", pfs_backend.driver_name);
         send_reply(c, id, "error", "driver_not_installed", m, NULL, -1); return;
     }
@@ -834,9 +948,28 @@ static void do_register(Conn *c, const Json *j, const WCHAR *id)
     e->id = g_next_id++;
     e->next = g_entries; g_entries = e;
     LeaveCriticalSection(&g_lock);
+    // Mount after the entry exists: an idle unmount that is deciding right now sees it, or finishes first and this mounts again.
+    int mrc = mount_now();
+    if (mrc && !defer) {
+        EnterCriticalSection(&g_lock); remove_entry_locked(e); LeaveCriticalSection(&g_lock);
+        if (mrc == MOUNT_NOT_INSTALLED) {
+            char m[128]; snprintf(m, sizeof m, "%ls is not installed; install it and try again", pfs_backend.driver_name);
+            send_reply(c, id, "error", "driver_not_installed", m, NULL, -1);
+        } else send_reply(c, id, "error", "mount_failed", "the file system could not be mounted (see the service log)", NULL, -1);
+        return;
+    }
+    if (mrc) { EnterCriticalSection(&g_lock); e->defer_pending = TRUE; LeaveCriticalSection(&g_lock); SetEvent(g_wake); }
     WCHAR full[MAX_PATHW]; swprintf_s(full, MAX_PATHW, L"%ls\\%ls", g_mount, name);
-    logf_("registered %ls -> %ls%ls", pipe, name, link ? L" (linked)" : L"");
-    send_reply(c, id, "ok", NULL, NULL, full, link ? TRUE : FALSE);
+    logf_("registered %ls -> %ls%ls%ls", pipe, name, link ? L" (linked)" : L"", mrc ? L" (waiting for the mount)" : L"");
+    send_reply_x(c, id, "ok", NULL, NULL, full, link ? TRUE : FALSE, defer ? (mrc == 0) : -1);
+}
+
+// `retry_mount`: try to mount now (an installer that has just installed the driver says so instead of waiting for the next check).
+static void do_retry_mount(Conn *c, const WCHAR *id)
+{
+    int rc = mount_now();
+    if (rc == 0) announce_mounted();
+    send_reply_x(c, id, "ok", NULL, NULL, NULL, -1, rc == 0);
 }
 
 static void do_unregister(Conn *c, const Json *j, const WCHAR *id)
@@ -902,6 +1035,7 @@ static DWORD WINAPI conn_thread(LPVOID arg)
         if (!type) send_reply(c, id, "error", "bad_request", "type is required", NULL, -1);
         else if (0 == wcscmp(type, L"register")) do_register(c, j, id);
         else if (0 == wcscmp(type, L"unregister")) do_unregister(c, j, id);
+        else if (0 == wcscmp(type, L"retry_mount")) do_retry_mount(c, id);
         else send_reply(c, id, "error", "bad_request", "unknown type", NULL, -1);
     }
     CloseHandle(ov.hEvent);
@@ -1008,15 +1142,26 @@ static BOOL enable_privilege(const WCHAR *name)
     return ok;
 }
 
+// The folder that holds the mount (and the log) must not be writable by ordinary users: while nothing is mounted a
+// user could otherwise plant a file or a link where the mount will appear. SYSTEM and Administrators write; users read.
+static void harden_data_dir(void)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)", SDDL_REVISION_1, &sd, NULL)) return;
+    BOOL ok = FALSE; PACL dacl = NULL, present = NULL; BOOL has = FALSE, def = FALSE;
+    if (GetSecurityDescriptorDacl(sd, &has, &dacl, &def) && has)
+        ok = ERROR_SUCCESS == SetNamedSecurityInfoW((LPWSTR)L"C:\\ProgramData\\PipeFileService", SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, NULL, NULL, dacl, NULL);
+    (void)present;
+    if (!ok) logf_("warning: could not restrict the access to C:\\ProgramData\\PipeFileService: %lu", GetLastError());
+    LocalFree(sd);
+}
+
 static int serve(const WCHAR *mount)
 {
-    if (!pfs_backend.installed()) {
-        // Normal exit, no control pipe, nothing polling: start the service again once the driver is installed.
-        logf_("%ls is not installed (get it from %s); exiting without opening the control pipe. Start the service again after installing it.",
-            pfs_backend.driver_name, pfs_backend.driver_url);
-        return 0;
-    }
     InitializeCriticalSection(&g_lock);
+    InitializeCriticalSection(&g_mount_lock);
+    g_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
     wcscpy_s(g_mount, MAX_PATHW, mount);
     size_t ml = wcslen(g_mount);
     while (ml > 3 && g_mount[ml - 1] == L'\\') g_mount[--ml] = 0;
@@ -1025,11 +1170,15 @@ static int serve(const WCHAR *mount)
     if (!enable_privilege(L"SeCreateSymbolicLinkPrivilege")) logf_("warning: SeCreateSymbolicLinkPrivilege is not available; links will fail");
     if (!sddl_to_sd(L"O:SYG:SYD:P(A;;FA;;;SY)(A;;FRFX;;;AU)", &g_root_sd, &g_root_sdsz)) { logf_("cannot build the root security descriptor"); return 12; }
 
-    int rc = pfs_backend.start(g_mount);
-    if (rc) return rc;
+    harden_data_dir();
 
+    // Nothing is mounted yet: the first registration mounts (see mount_now), and the control pipe is up from the start,
+    // whether or not the driver is installed.
     HANDLE acc = CreateThread(NULL, 0, accept_thread, NULL, 0, NULL);
-    logf_("serving on %ls; control pipe %ls", g_mount, CONTROL_PIPE);
+    HANDLE mt = CreateThread(NULL, 0, mount_thread, NULL, 0, NULL);
+    if (pfs_backend.installed()) logf_("%ls is installed", pfs_backend.driver_name);
+    else logf_("%ls is not installed (get it from %s); registrations are refused, or wait with defer, until it is", pfs_backend.driver_name, pfs_backend.driver_url);
+    logf_("serving on %ls (mounted when needed, unmounted after %d s unused); control pipe %ls", g_mount, LIM(LIM_IDLE), CONTROL_PIPE);
     logf_("limits: %d registrations per connection, %d per user; %d connections, %d per user",
         LIM(LIM_REG_CONN), LIM(LIM_REG_USER), LIM(LIM_CONNS), LIM(LIM_CONNS_USER));
     WaitForSingleObject(g_stop, INFINITE);
@@ -1045,7 +1194,8 @@ static int serve(const WCHAR *mount)
     EnterCriticalSection(&g_lock);
     while (g_entries) remove_entry_locked(g_entries);
     LeaveCriticalSection(&g_lock);
-    pfs_backend.stop();
+    WaitForSingleObject(mt, 5000); CloseHandle(mt);
+    unmount_now();
     logf_("stopped");
     return 0;
 }
@@ -1216,6 +1366,7 @@ static int usage(void)
         L"  limits on the control pipe (defaults in brackets; install keeps them for the service):\n"
         L"      --max-reg-per-conn <n> [64]   --max-reg-per-user <n> [256]\n"
         L"      --max-conn <n> [128]          --max-conn-per-user <n> [16]\n"
+        L"      --idle-seconds <n> [30]       how long nothing is registered or open before the mount is removed\n"
         L"      %ls\n"
         L"  --version\n"
         L"default mount: %ls\n",

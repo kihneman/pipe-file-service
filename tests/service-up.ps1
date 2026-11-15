@@ -3,7 +3,8 @@
 # and finally tests\service-down.ps1.
 param(
     [string]$Backend = 'winfsp', [string]$Exe = (Join-Path $PSScriptRoot "..\PipeFileService-$Backend.exe"),
-    [string]$Mount = 'C:\ProgramData\PipeFileService\mount'
+    [string]$Mount = 'C:\ProgramData\PipeFileService\mount',
+    [int]$IdleSeconds = 0   # > 0: install with --idle-seconds (tests\idle.ps1 wants a short grace period)
 )
 $ErrorActionPreference = 'Stop'
 $Exe = [IO.Path]::GetFullPath($Exe)
@@ -15,7 +16,9 @@ $adminOwned = Join-Path $env:TEMP 'fsp-service-smoke-adminowned'
 Remove-Item $adminOwned -Force -ErrorAction SilentlyContinue
 New-Item $adminOwned -ItemType File | Out-Null
 icacls $adminOwned /grant "*$($id.User.Value):(M)" | Out-Null
-& $Exe install --mount $Mount
+$installArgs = @('install', '--mount', $Mount)
+if ($IdleSeconds -gt 0) { $installArgs += @('--idle-seconds', $IdleSeconds) }
+& $Exe @installArgs
 if ($LASTEXITCODE) { throw 'install failed' }
 Start-Service PipeFileService
 Start-Sleep -Seconds 3

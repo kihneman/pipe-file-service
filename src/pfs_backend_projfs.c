@@ -194,7 +194,8 @@ static int start(const WCHAR *mount)
 {
     if (projfs_is_drive_mount(mount)) { pfs_log("the ProjFS build serves a folder, not a drive letter: use --mount <folder>"); return 14; }
     wcscpy_s(g_root, MAX_PATHW, mount);
-    InitializeCriticalSection(&g_enum_lock);
+    static BOOL lock_ready;   // start and stop now run again and again, as registrations come and go
+    if (!lock_ready) { InitializeCriticalSection(&g_enum_lock); lock_ready = TRUE; }
 
     // No owner in the descriptor: the creator owns the folder (naming another owner needs a privilege that `run` in an
     // elevated console does not have).
@@ -244,4 +245,5 @@ const PfsBackend pfs_backend = {
     L"--projfs-dir <folder>",
     L"--projfs-dir makes the ProjFS check look for <folder>\\projectedfslib.dll instead of the real install",
     TRUE,   // requires_size
+    projfs_files_open,
 };

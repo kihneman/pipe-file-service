@@ -62,8 +62,17 @@ static BOOL projfs_pid_may(ProjfsStatFn stat, UINT32 pid, const WCHAR *cpath, AC
 // Dehydrate on close, and the folder is read-only. The delete runs for every close, including a stat; the name is
 // projected again on the next lookup. Best effort: it fails while another handle has the file open, and then the
 // data stays until a later close.
+static volatile LONG g_projfs_files_open;   // opens minus closes of files in the projected folder (directories are not counted)
+
+static LONG projfs_files_open(void) { LONG n = g_projfs_files_open; return n < 0 ? 0 : n; }
+
 static HRESULT projfs_notify(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT ctx, const PRJ_CALLBACK_DATA *d, BOOLEAN dir, PRJ_NOTIFICATION n)
 {
+    if (!dir) {
+        if (n == PRJ_NOTIFICATION_FILE_OPENED) InterlockedIncrement(&g_projfs_files_open);
+        else if (n == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_NO_MODIFICATION || n == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED ||
+                 n == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED) InterlockedDecrement(&g_projfs_files_open);
+    }
     switch (n) {
     case PRJ_NOTIFICATION_PRE_DELETE: case PRJ_NOTIFICATION_PRE_RENAME:
     case PRJ_NOTIFICATION_PRE_SET_HARDLINK: case PRJ_NOTIFICATION_FILE_PRE_CONVERT_TO_FULL:
@@ -81,7 +90,8 @@ static HRESULT projfs_notify(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT ctx, const PRJ
 }
 
 static const PRJ_NOTIFY_TYPES PROJFS_NOTIFY_MASK = (PRJ_NOTIFY_TYPES)(PRJ_NOTIFY_PRE_DELETE | PRJ_NOTIFY_PRE_RENAME |
-    PRJ_NOTIFY_PRE_SET_HARDLINK | PRJ_NOTIFY_FILE_PRE_CONVERT_TO_FULL | PRJ_NOTIFY_FILE_HANDLE_CLOSED_NO_MODIFICATION);
+    PRJ_NOTIFY_PRE_SET_HARDLINK | PRJ_NOTIFY_FILE_PRE_CONVERT_TO_FULL | PRJ_NOTIFY_FILE_HANDLE_CLOSED_NO_MODIFICATION |
+    PRJ_NOTIFY_FILE_OPENED | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED);
 
 // True when the Windows feature Client-ProjFS is on: projectedfslib.dll is in the system directory and the PrjFlt
 // filter driver service exists. Loads no ProjFS code.
