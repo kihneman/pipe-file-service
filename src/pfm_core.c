@@ -18,6 +18,8 @@
 #define MAX_PATH_CHARS 2048
 
 static WCHAR g_pipe[512];
+#define MAX_DECLARED_SIZE (1ull << 30)   // largest `--size` (1 GiB)
+static BOOL g_has_size; static UINT64 g_size;   // --size: the length the content must have
 static HANDLE g_stop;
 static UINT64 g_now;
 
@@ -254,6 +256,14 @@ static NTSTATUS ensure_data(Ctx *c)
         logf_("FETCH pid=%u", c->pid);
         c->result = c->proc ? fetch_forwarded(c->pid, c->start, &c->data, &c->len)
                             : fetch(&c->data, &c->len);
+        if (NT_SUCCESS(c->result) && g_has_size && c->len != g_size) {
+            // The file already reported its declared size; padding or cutting the secret would hand the reader a
+            // wrong one, so the read fails instead.
+            logf_("  the server sent %zu bytes but %llu were declared", c->len, (unsigned long long)g_size);
+            if (c->data) { SecureZeroMemory(c->data, c->len); free(c->data); c->data = NULL; }
+            c->len = 0;
+            c->result = STATUS_IO_DEVICE_ERROR;
+        }
         c->done = TRUE;
         logf_("  -> 0x%08x, %zu bytes", (unsigned)c->result, c->len);
         if (c->proc) { CloseHandle(c->proc); c->proc = NULL; }
@@ -299,7 +309,7 @@ static void fill_info(const Ctx *c, PfmInfo *i)
 {
     BOOL file = is_file(c->depth);
     i->dir = !file;
-    i->size = file ? c->len : 0;
+    i->size = file ? (g_has_size ? g_size : c->len) : 0;
     i->id = (UINT64)c->depth + 1;
     i->time = g_now;
 }
@@ -406,7 +416,18 @@ int wmain(int argc, wchar_t **argv)
     }
     const wchar_t *suffix = NULL;
     int bad_option = 0;
-    for (int i = 1; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {   // --size <bytes>
+        if (0 != wcscmp(argv[i], L"--size")) continue;
+        BOOL digits = i + 1 < argc && argv[i + 1][0] >= L'0' && argv[i + 1][0] <= L'9';
+        for (const wchar_t *q = i + 1 < argc ? argv[i + 1] : L""; *q && digits; q++) digits = (*q >= L'0' && *q <= L'9');
+        if (g_has_size || !digits || wcslen(argv[i + 1]) > 19) { bad_option = 1; break; }
+        g_size = _wcstoui64(argv[i + 1], NULL, 10);
+        if (g_size > MAX_DECLARED_SIZE) { bad_option = 1; break; }
+        g_has_size = TRUE;
+        memmove(&argv[i], &argv[i + 2], (argc - i - 2) * sizeof(*argv));
+        argc -= 2; i--;
+    }
+    for (int i = 1; !bad_option && i < argc; i++) {
         if (0 != wcscmp(argv[i], L"--reader-info-suffix")) continue;
         if (suffix || i + 1 >= argc || argv[i + 1][0] == 0) { bad_option = 1; break; }
         suffix = argv[i + 1];
@@ -415,9 +436,11 @@ int wmain(int argc, wchar_t **argv)
     }
     if (bad_option || argc < 3 || argc > 4) {
         fwprintf(stderr,
-            L"usage: pipe-file-mount <\\\\.\\pipe\\name> <mountpoint: K: or *> [path on the volume] [--reader-info-suffix <suffix>]\n"
+            L"usage: pipe-file-mount <\\\\.\\pipe\\name> <mountpoint: K: or *> [path on the volume] [--reader-info-suffix <suffix>] [--size <bytes>]\n"
             L"  --reader-info-suffix: do not read the pipe directly; open <pipe name><suffix>, tell the server which\n"
             L"  program opened the file (PID and start time) and read the content it serves for that program\n"
+            L"  --size: the length of the content in bytes (0 to 1073741824); the file reports it from the start and a read\n"
+            L"  of any other length fails. Required by the ProjFS build\n"
             L"  path defaults to %ls; directories above the file are created virtually,\n"
             L"  e.g. \\secrets\\app\\prod.env\n", DEFAULT_PATH);
         return 2;
@@ -425,6 +448,10 @@ int wmain(int argc, wchar_t **argv)
     const char *why = NULL;
     if (!parse_path(argc == 4 ? argv[3] : DEFAULT_PATH, &why)) {
         fprintf(stderr, "invalid path: %s\n", why);
+        return 2;
+    }
+    if (pfm_backend.requires_size && !g_has_size) {
+        fprintf(stderr, "this build needs the length of the content: add --size <bytes>\n");
         return 2;
     }
     // The driver's DLL is delay-loaded so a missing driver gives this message, not a loader error.

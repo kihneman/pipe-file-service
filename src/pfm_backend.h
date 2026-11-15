@@ -58,6 +58,9 @@ typedef struct {
     // one) and starts serving. Returns 0, or nonzero after printing why it failed.
     int (*start)(const WCHAR *mount);
     void (*stop)(void);
+    // TRUE when the file system needs the file's final size before its first read (a projection into a folder does):
+    // the program then refuses to start without `--size`.
+    BOOL requires_size;
 } PfmBackend;
 
 extern const PfmBackend pfm_backend;

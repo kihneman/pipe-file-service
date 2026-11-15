@@ -8,7 +8,7 @@ Shows a Windows named pipe as a read-only file, so tools that only know how to o
 secret that another program serves over the pipe. The file sits on a small virtual volume provided by a
 user-mode file system driver, [WinFsp](https://github.com/winfsp/winfsp) or
 [Dokan](https://github.com/dokan-dev/dokany). The content is fetched from the pipe on the first read of each
-open handle and is never written to disk (the ProjFS service build is the exception, see [ProjFS](#projfs-the-service-only)).
+open handle and is never written to disk (the ProjFS builds are the exception, see [ProjFS](#projfs)).
 
 There are two programs, each built once per driver (`-winfsp` and `-dokan`; see
 [Backends](#backends-winfsp-dokan-or-projfs)):
@@ -408,9 +408,9 @@ The Dokan `pipe-file-mount` takes the same arguments. A drive letter works as wi
 `scripts\get-dokan-sdk.ps1` fetches the Dokan headers and import library (every download checked against a
 pinned SHA-256) without installing the driver.
 
-#### ProjFS (the service only)
+#### ProjFS
 
-`build.ps1 -Backend projfs` builds `PipeFileService-projfs.exe`. It uses the Windows Projected File System, an
+`build.ps1 -Backend projfs` builds `PipeFileService-projfs.exe` and `pipe-file-mount-projfs.exe`. They use the Windows Projected File System, an
 optional Windows feature (`Client-ProjFS`) with Microsoft's own library and filter driver: there is no third-party
 driver to install or license. Enable it with `Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
 -NoRestart` (elevated; no restart was needed on Windows 11). It is a different kind of file system from the other
@@ -430,9 +430,26 @@ two, and **it does not keep their guarantee that the secret is never written to 
 - The size of the file must be known before the first read, so `register` **requires `size`** in this build and
   answers `size_required` without it.
 - `--mount` must name a folder (the default is fine), not a drive letter. The service deletes whatever is in the
-  folder at start and removes the folder at stop. There is no ProjFS `pipe-file-mount`.
+  folder at start and removes the folder at stop.
 - The driver check is that `projectedfslib.dll` is in the system folder and the `PrjFlt` service exists.
   `tests\projfs.ps1` covers what is specific to this build.
+
+`pipe-file-mount-projfs.exe` takes the same arguments as the other mount tools, with three differences:
+
+- The mount point is a folder, not a drive letter or `*`. The folder must not exist or must be empty (a folder a
+  killed run left behind is cleaned; anything else that is not empty is refused and left alone). The tool
+  removes it when it stops, or puts an empty folder back if one was there.
+- `--size <bytes>` is required (0 to 1073741824): the file reports it from the start and a read of any other
+  length fails.
+- The folder allows only the user who started the tool, and SYSTEM; the files inherit that, and it is the user's
+  own folder, so the user can also create other files in it (they are removed at stop). Reads, writes, deletes
+  and renames of the served file behave as for the service.
+
+```
+pipe-file-mount-projfs.exe \\.\pipe\secrets C:\work\secrets \app\prod.env --size 1234
+```
+
+`tests\projfs-mount.ps1` covers it (no administrator rights needed).
 
 ## Releases
 
