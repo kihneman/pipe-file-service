@@ -35,7 +35,12 @@ function Get-Pipe($i) {
     }
     "\\.\pipe\$base-$i"
 }
-function Reg($c, $i) { Req $c @{ type = 'register'; pipe = (Get-Pipe $i); file_name = "$base-$i.env" } }
+# A build whose file system needs the size up front (ProjFS) refuses a register without one: ask again with the size.
+function Reg($c, $i) {
+    $r = Req $c @{ type = 'register'; pipe = (Get-Pipe $i); file_name = "$base-$i.env" }
+    if ($r.code -eq 'size_required') { $r = Req $c @{ type = 'register'; pipe = (Get-Pipe $i); file_name = "$base-$i.env"; size = 1 } }
+    $r
+}
 $clients = @()
 try {
     # ---- per connection

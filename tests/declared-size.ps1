@@ -94,9 +94,13 @@ try {
 
     # ---- without a size nothing changes: size 0 until a handle has read
     $r = Reg $c "$base-none" 'n.env'
-    $f = $r.path
-    Check 'no size: reported size is 0 before a read' ((Get-Item $f).Length -eq 0)
-    Check 'no size: read returns the content' (([IO.File]::ReadAllText($f)) -eq $content)
+    if ($r.code -eq 'size_required') {
+        Check 'no size: this build refuses a registration without one (size_required)' ($r.status -eq 'error') ($r | ConvertTo-Json -Compress)
+    } else {
+        $f = $r.path
+        Check 'no size: reported size is 0 before a read' ((Get-Item $f).Length -eq 0)
+        Check 'no size: read returns the content' (([IO.File]::ReadAllText($f)) -eq $content)
+    }
 
     # ---- bad values are refused with bad_request
     foreach ($bad in @('abc', '-1', '1.5', '', 1073741825, '99999999999999999999')) {

@@ -4,7 +4,8 @@
 # Each backend gives its own pair of programs, so a shipped exe references exactly one driver:
 #   -Backend winfsp  PipeFileService-winfsp.exe, pipe-file-mount-winfsp.exe
 #   -Backend dokan   PipeFileService-dokan.exe, pipe-file-mount-dokan.exe
-#   -Backend all     both
+#   -Backend projfs  PipeFileService-projfs.exe (service only; the Windows Projected File System, no driver)
+#   -Backend all     every backend
 #
 # -WinFsp must point at a folder containing inc\winfsp\winfsp.h and
 # lib\winfsp-x64.lib: an installed WinFsp (with the Developer feature) or the
@@ -12,7 +13,7 @@
 # -Dokan must point at a folder containing inc\dokan.h and lib\dokan2.lib: the
 # folder printed by scripts\get-dokan-sdk.ps1.
 param(
-    [ValidateSet('winfsp', 'dokan', 'all')][string]$Backend = 'winfsp',
+    [ValidateSet('winfsp', 'dokan', 'projfs', 'all')][string]$Backend = 'winfsp',
     [string]$WinFsp = 'C:\Program Files (x86)\WinFsp',
     [string]$Dokan = (Join-Path $PSScriptRoot '.dokan-sdk')
 )
@@ -30,6 +31,7 @@ function Enter-Msvc {
 
 $buildWinFsp = $Backend -in 'winfsp', 'all'
 $buildDokan = $Backend -in 'dokan', 'all'
+$buildProjFS = $Backend -in 'projfs', 'all'
 if ($buildWinFsp -and -not (Test-Path "$WinFsp\inc\winfsp\winfsp.h")) {
     throw "WinFsp SDK not found in $WinFsp. Install WinFsp with the Developer feature, or run scripts\get-winfsp-sdk.ps1."
 }
@@ -50,6 +52,9 @@ function Invoke-Cl($out, $objDir, $sources, $include, $lib, $dll) {
 if ($buildWinFsp) {
     Invoke-Cl 'pipe-file-mount-winfsp.exe' 'build\winfsp-mount' @('src\pfm_core.c', 'src\pfm_backend_winfsp.c') "$WinFsp\inc" "$WinFsp\lib\winfsp-x64.lib" 'winfsp-x64.dll'
     Invoke-Cl 'PipeFileService-winfsp.exe' 'build\winfsp' @('src\pfs_core.c', 'src\pfs_backend_winfsp.c') "$WinFsp\inc" "$WinFsp\lib\winfsp-x64.lib" 'winfsp-x64.dll'
+}
+if ($buildProjFS) {   # ProjFS is part of Windows: the import library comes with the Windows SDK, no driver SDK to fetch
+    Invoke-Cl 'PipeFileService-projfs.exe' 'build\projfs' @('src\pfs_core.c', 'src\pfs_backend_projfs.c') '.' 'ProjectedFSLib.lib' 'projectedfslib.dll'
 }
 if ($buildDokan) {
     Invoke-Cl 'pipe-file-mount-dokan.exe' 'build\dokan-mount' @('src\pfm_core.c', 'src\pfm_backend_dokan.c') "$Dokan\inc" "$Dokan\lib\dokan2.lib" 'dokan2.dll'

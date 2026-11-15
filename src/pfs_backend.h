@@ -61,6 +61,9 @@ typedef struct {
     BOOL (*parse_run_option)(const WCHAR *flag, const WCHAR *value);
     const WCHAR *run_option_synopsis;   // for the usage text, e.g. L"--winfsp-dir <folder>"
     const WCHAR *run_option_help;       // one explanatory usage line
+    // TRUE when the file system needs a file's final size before its first read (a projection into a folder does):
+    // `register` then refuses a registration without `size` (code `size_required`).
+    BOOL requires_size;
 } PfsBackend;
 
 extern const PfsBackend pfs_backend;

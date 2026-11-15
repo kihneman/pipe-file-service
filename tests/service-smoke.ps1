@@ -12,6 +12,9 @@ New-Item -ItemType Directory $work | Out-Null
 $content = "# smoke`nKEY=value`n"
 $script:failures = 0
 $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+# The ProjFS build projects into a real folder, whose files take the folder's access control (SYSTEM and authenticated
+# users) instead of a per-file descriptor: two of the checks below differ for it.
+$isProjFS = [bool]((Get-CimInstance Win32_Service -Filter "Name='PipeFileService'" -ErrorAction SilentlyContinue).PathName -match 'projfs')
 function Check($name, $ok, $detail) {
     if ($ok) { "PASS  $name" } else { "FAIL  $name   $detail"; $script:failures++ }
 }
@@ -41,7 +44,10 @@ function Req($c, $h) {
 function Reg($c, $pipe, $file, $extra) {
     $h = @{ type = 'register'; pipe = "\\.\pipe\$pipe"; file_name = $file }
     if ($extra) { foreach ($k in $extra.Keys) { $h[$k] = $extra[$k] } }
-    Req $c $h
+    $r = Req $c $h
+    # A build whose file system needs the size up front (ProjFS) refuses a register without one: ask again with the size.
+    if ($r.code -eq 'size_required' -and -not $h.ContainsKey('size')) { $h.size = [Text.Encoding]::UTF8.GetByteCount($content); $r = Req $c $h }
+    $r
 }
 
 # ---- data servers (jobs). Each connection appends a line to the log.
@@ -111,7 +117,11 @@ try {
     Check 'an "opened" event was pushed' (@($script:events | Where-Object { $_.event -eq 'opened' }).Count -ge 1)
     $acl = Get-Acl $file
     $users = @($acl.Access | ForEach-Object { $_.IdentityReference.Value })
-    Check 'file ACL: only the registering user and SYSTEM' ($users.Count -eq 2 -and ($users -contains 'NT AUTHORITY\SYSTEM') -and ($users -contains [Security.Principal.WindowsIdentity]::GetCurrent().Name)) ($users -join ',')
+    if ($isProjFS) {
+        Check 'file ACL (ProjFS): SYSTEM and authenticated users, read only' ($users.Count -eq 2 -and ($users -contains 'NT AUTHORITY\SYSTEM') -and ($users -contains 'NT AUTHORITY\Authenticated Users')) ($users -join ',')
+    } else {
+        Check 'file ACL: only the registering user and SYSTEM' ($users.Count -eq 2 -and ($users -contains 'NT AUTHORITY\SYSTEM') -and ($users -contains [Security.Principal.WindowsIdentity]::GetCurrent().Name)) ($users -join ',')
+    }
     $wrote = $true; try { Set-Content $file 'x' -ErrorAction Stop } catch { $wrote = $false }
     Check 'writes are refused' (-not $wrote)
 
@@ -147,7 +157,13 @@ public static class DenyOnly {
     $denied = $null; $began = [DenyOnly]::Begin()
     try { try { $null = [IO.File]::ReadAllText($file); $denied = $false } catch [UnauthorizedAccessException] { $denied = $true } catch { $denied = "other: $($_.Exception.Message)" } }
     finally { [DenyOnly]::End() }
-    Check 'a caller that is not the registering user cannot read the file' ($began -and $denied -eq $true) "began=$began denied=$denied"
+    if ($isProjFS) {
+        # ProjFS asks the provider about the PROCESS that triggers a request, not the calling thread, so a thread that
+        # impersonates another user is not seen; and a file that is already hydrated is served by NTFS under the folder's ACL.
+        'SKIP  a caller that is not the registering user cannot read the file (not testable with a thread token on ProjFS)'
+    } else {
+        Check 'a caller that is not the registering user cannot read the file' ($began -and $denied -eq $true) "began=$began denied=$denied"
+    }
     Check 'the registering user still can' (([IO.File]::ReadAllText($file)) -eq $content)
 
     # ---- registration rules

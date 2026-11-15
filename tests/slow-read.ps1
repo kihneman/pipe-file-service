@@ -41,6 +41,8 @@ try {
     Start-Sleep -Milliseconds 500
     $c = New-Client
     $r = Req $c @{ type = 'register'; pipe = "\\.\pipe\$base-d"; file_name = 'slow.env' }
+    # A build whose file system needs the size up front (ProjFS) refuses a register without one: ask again with the size.
+    if ($r.code -eq 'size_required') { $r = Req $c @{ type = 'register'; pipe = "\\.\pipe\$base-d"; file_name = 'slow.env'; size = [Text.Encoding]::UTF8.GetByteCount($content) } }
     Check 'register' ($r.status -eq 'ok' -and $r.path) ($r | ConvertTo-Json -Compress)
     $file = $r.path
     $sw = [Diagnostics.Stopwatch]::StartNew()
