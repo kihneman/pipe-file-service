@@ -777,6 +777,10 @@ static void do_register(Conn *c, const Json *j, const WCHAR *id)
         }
         has_size = TRUE;
     }
+    if (pfs_backend.requires_size && !has_size) {
+        char m[160]; snprintf(m, sizeof m, "this build (%ls) needs the size of the content: add \"size\" to the request", pfs_backend.driver_name);
+        send_reply(c, id, "error", "size_required", m, NULL, -1); return;
+    }
     // The caller must be able to reach the pipe it registers (checked as the caller; only the pipe that will be read).
     Entry *e = (Entry *)calloc(1, sizeof *e);
     wcscpy_s(e->pipe, MAX_PIPE + 1, pipe);

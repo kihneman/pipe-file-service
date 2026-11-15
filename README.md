@@ -8,10 +8,10 @@ Shows a Windows named pipe as a read-only file, so tools that only know how to o
 secret that another program serves over the pipe. The file sits on a small virtual volume provided by a
 user-mode file system driver, [WinFsp](https://github.com/winfsp/winfsp) or
 [Dokan](https://github.com/dokan-dev/dokany). The content is fetched from the pipe on the first read of each
-open handle and is never written to disk.
+open handle and is never written to disk (the ProjFS service build is the exception, see [ProjFS](#projfs-the-service-only)).
 
 There are two programs, each built once per driver (`-winfsp` and `-dokan`; see
-[Backends](#backends-winfsp-or-dokan)):
+[Backends](#backends-winfsp-dokan-or-projfs)):
 
 - `pipe-file-mount-<driver>.exe` mounts one pipe as one file, in the process that runs it
   ([How it works](#how-it-works));
@@ -116,7 +116,7 @@ PipeFileService.exe run [--mount <...>] [--winfsp-dir <folder> | --dokan-dir <fo
 
 The default mount is `C:\ProgramData\PipeFileService\mount`. `--mount` names a folder that does not
 exist, or a drive letter; the service prepares the folder itself (WinFsp needs a mount folder that does
-not exist and Dokan one that exists and is empty, see [Backends](#backends-winfsp-or-dokan)). The service is `PipeFileService`, display name "Pipe File
+not exist and Dokan one that exists and is empty, see [Backends](#backends-winfsp-dokan-or-projfs)). The service is `PipeFileService`, display name "Pipe File
 Service", runs as LocalSystem with a minimal privilege list
 (`SeCreateSymbolicLinkPrivilege`, `SeImpersonatePrivilege`, `SeChangeNotifyPrivilege`)
 and is started on demand, or at every boot with `install --auto-start`. It writes
@@ -365,7 +365,8 @@ and the SDK of each driver you build for:
 .\build.ps1 -WinFsp .\.winfsp-sdk\DYNAMIC
 .\scripts\get-dokan-sdk.ps1              # fetch the Dokan headers and import library, no driver install
 .\build.ps1 -Backend dokan               # Dokan programs (uses .\.dokan-sdk)
-.\build.ps1 -Backend all -WinFsp .\.winfsp-sdk\DYNAMIC   # both
+.\build.ps1 -Backend projfs             # ProjFS service (no driver SDK: uses the Windows SDK)
+.\build.ps1 -Backend all -WinFsp .\.winfsp-sdk\DYNAMIC   # every backend
 ```
 
 `get-winfsp-sdk.ps1` downloads a pinned WinFsp release MSI, checks its SHA-256 and
@@ -380,7 +381,7 @@ placeholder links, fetch on first read, service install) and one file system dri
 `src\pfs_backend.h`. The mount tool has the same shape (`src\pfm_core.c`, `src\pfm_backend_*.c`,
 `src\pfm_backend.h`). A build links exactly one backend, so each exe references exactly one driver.
 
-### Backends: WinFsp or Dokan
+### Backends: WinFsp, Dokan or ProjFS
 
 `build.ps1 -Backend winfsp|dokan|all` builds `PipeFileService-winfsp.exe` and/or `PipeFileService-dokan.exe`
 (and `pipe-file-mount-winfsp.exe` / `pipe-file-mount-dokan.exe`). The two services behave the same: same service name
@@ -406,6 +407,32 @@ The Dokan `pipe-file-mount` takes the same arguments. A drive letter works as wi
 
 `scripts\get-dokan-sdk.ps1` fetches the Dokan headers and import library (every download checked against a
 pinned SHA-256) without installing the driver.
+
+#### ProjFS (the service only)
+
+`build.ps1 -Backend projfs` builds `PipeFileService-projfs.exe`. It uses the Windows Projected File System, an
+optional Windows feature (`Client-ProjFS`) with Microsoft's own library and filter driver: there is no third-party
+driver to install or license. Enable it with `Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+-NoRestart` (elevated; no restart was needed on Windows 11). It is a different kind of file system from the other
+two, and **it does not keep their guarantee that the secret is never written to disk**:
+
+- ProjFS projects names into a real folder. When a file is read, the content is written into that folder as an
+  ordinary NTFS file. The backend deletes the file again when the handle that read it closes, so the next read
+  asks the data server again, but a reader that opens the file while it is still there gets the data from the
+  disk without a request to the data server (in a test with two readers, about one read in five), and if the
+  service crashes, the file stays on disk until the next start (the service empties the folder at every start).
+- The files take the access control of the folder: SYSTEM full control and authenticated users read. The
+  registering user's permission is checked, against the process that made the request, only when ProjFS asks the
+  service for the placeholder or the data; a file that is already on disk is served by NTFS to anyone the folder's
+  access control allows. On a machine with several users this is weaker than the other builds.
+- Writes, deletes, renames and new files are refused (the folder allows no writes, and the service vetoes
+  delete, rename and hard links).
+- The size of the file must be known before the first read, so `register` **requires `size`** in this build and
+  answers `size_required` without it.
+- `--mount` must name a folder (the default is fine), not a drive letter. The service deletes whatever is in the
+  folder at start and removes the folder at stop. There is no ProjFS `pipe-file-mount`.
+- The driver check is that `projectedfslib.dll` is in the system folder and the `PrjFlt` service exists.
+  `tests\projfs.ps1` covers what is specific to this build.
 
 ## Releases
 
@@ -483,7 +510,7 @@ drive letter (default `K`):
 - Dokan: the directory fill function always returns 0 whether or not the entry was taken, so its
   return value must not be read as "buffer full". An open request that stays pending longer than the
   volume's timeout unmounts the whole volume. Dokan does not enforce per-file permissions
-  (see [Backends](#backends-winfsp-or-dokan)).
+  (see [Backends](#backends-winfsp-dokan-or-projfs)).
 - The volume's security descriptor allows only the current user and SYSTEM, so
   other users cannot trigger reads through the mount tool.
 
@@ -503,6 +530,9 @@ WinFsp itself only as the unmodified installer released by the WinFsp project.
 
 > WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
 > https://github.com/winfsp/winfsp
+
+**ProjFS build** (`PipeFileService-projfs.exe`) uses only the Windows Projected File System API, a component of
+Windows (the feature `Client-ProjFS`); no third-party driver or library is involved.
 
 **Dokan builds** (`PipeFileService-dokan.exe`, `pipe-file-mount-dokan.exe`) do not use WinFsp. They use
 [Dokan](https://github.com/dokan-dev/dokany) (Dokany) 2.x. Its user-mode library (`dokan2.dll`) and driver
