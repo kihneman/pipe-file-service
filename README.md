@@ -1,21 +1,26 @@
 # pipe-file-service
 
 > Formerly `winfsp-pipe-bridge` (programs `winfsp-pipe-bridge.exe` and `FspPipeFileService.exe`, service
-> `FspPipeFileService`). They are now `pipe-file-mount.exe` and `PipeFileService.exe`; `PipeFileService.exe install`
-> removes a service still registered under the old name.
+> `FspPipeFileService`). They are now `pipe-file-mount-<driver>.exe` and `PipeFileService-<driver>.exe` (service
+> `PipeFileService`); `PipeFileService-<driver>.exe install` removes a service still registered under the old name.
 
-**Experimental spike.** Exposes a Windows named pipe as a read-only file on a
-[WinFsp](https://github.com/winfsp/winfsp) volume, so tools that only know how
-to open a file path can read a secret that a broker serves over a pipe. The
-content is fetched from the pipe on the first read of each open handle and
-is never written to disk.
+Shows a Windows named pipe as a read-only file, so tools that only know how to open a file path can read a
+secret that another program serves over the pipe. The file sits on a small virtual volume provided by a
+user-mode file system driver, [WinFsp](https://github.com/winfsp/winfsp) or
+[Dokan](https://github.com/dokan-dev/dokany). The content is fetched from the pipe on the first read of each
+open handle and is never written to disk.
 
-It is an independent personal project. It knows nothing about any particular
-server: it reads the pipe as an ordinary byte stream, or, with
-`--reader-info-suffix`, speaks the small protocol described below.
+There are two programs, each built once per driver (`-winfsp` and `-dokan`; see
+[Backends](#backends-winfsp-or-dokan)):
 
-> WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
-> https://github.com/winfsp/winfsp
+- `pipe-file-mount-<driver>.exe` mounts one pipe as one file, in the process that runs it
+  ([How it works](#how-it-works));
+- `PipeFileService-<driver>.exe` is a Windows service that does it for any local user's app and can link
+  placeholder files to the pipes ([PipeFileService](#pipefileservice)).
+
+It is an independent personal project, version 0.x and experimental. It knows nothing about any particular
+server: it reads the pipe as an ordinary byte stream, or, with `--reader-info-suffix`, speaks the small
+protocol described below. The drivers are not included; install the one you use.
 
 ## How it works
 
@@ -47,8 +52,7 @@ show or stat the file do not reach the server. If the pipe's server answers with
 its standard "Access denied" text the first read fails with
 `STATUS_ACCESS_DENIED`, and later reads on that handle repeat the failure without
 asking again. Two reads racing on a fresh handle share one fetch. For every open
-the mount tool logs the caller's PID and executable path, which WinFsp reports at open
-time.
+the mount tool logs the caller's PID and executable path, taken at open time.
 
 ### Telling the server who opened the file (`--reader-info-suffix`)
 
@@ -63,9 +67,9 @@ pipe-file-mount.exe \\.\pipe\secrets K: \secrets\app\prod.env --reader-info-suff
 
 The mount tool then opens `\\.\pipe\secrets-reader` (the pipe name plus the suffix),
 and on the first read of every handle opened for data it sends the caller's PID
-and process creation time. WinFsp reports the caller only in `Open`, so the mount tool
-records them there (and keeps a handle on the process so the PID cannot be
-reused) and sends them at the first read. The server answers for that caller.
+and process creation time. The caller is taken at `Open` (WinFsp reports it only there,
+Dokan on every request), so the mount tool records them there (and keeps a handle on
+the process so the PID cannot be reused) and sends them at the first read. The server answers for that caller.
 This is a request, not a hint: if the second pipe is missing or the server
 refuses, the first read fails (`STATUS_ACCESS_DENIED` when refused,
 `STATUS_IO_DEVICE_ERROR` when the server cannot be used). The mount tool never falls back to the data pipe,
@@ -83,7 +87,7 @@ After an `ok` response the server writes the content as raw bytes, unframed, and
 closes the pipe. After `denied`, or if the server closes the pipe without a
 response, the open fails with access denied. The server should verify the
 caller itself (the PID is still alive and was created at the stated time) and
-decide whether to trust the mount tool; the mount tool only reports what WinFsp told it.
+decide whether to trust the mount tool; the mount tool only reports what the file system driver told it.
 
 A server should only believe the caller information from a mount tool it
 recognises, for example by looking up the pipe client's process and checking the
@@ -94,22 +98,25 @@ file: a rebuilt or updated mount tool has a new hash and has to be trusted again
 ## PipeFileService
 
 A Windows service for apps that cannot start a program of their own, or that need a
-file *link*. It is the privileged counterpart of `pipe-file-mount.exe`: one
-long-running service, on one WinFsp volume, that any local user's app can ask to
+file *link*. It is the privileged counterpart of the mount tool: one
+long-running service, on one volume of the file system driver, that any local user's app can ask to
 
 1. show a named pipe as a read-only file (the **data server** is whatever serves the pipe), and
 2. turn an empty placeholder file the app made into a symlink to that file. Only a
    privileged process may create file symlinks without Developer Mode.
 
+In this README `PipeFileService.exe` stands for `PipeFileService-winfsp.exe` or `PipeFileService-dokan.exe`, and
+`pipe-file-mount.exe` for `pipe-file-mount-winfsp.exe` or `pipe-file-mount-dokan.exe`.
+
 ```
 PipeFileService.exe install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [limits]   (elevated)
 PipeFileService.exe uninstall                                                                                  (elevated)
-PipeFileService.exe run [--mount <...>] [--winfsp-dir <folder>] [limits]    run in this console (elevated), for development
+PipeFileService.exe run [--mount <...>] [--winfsp-dir <folder> | --dokan-dir <folder>] [limits]    run in this console (elevated), for development
 ```
 
-The default mount is `C:\ProgramData\PipeFileService\mount` (a WinFsp mount
-folder must not exist; the service creates the parent and removes an empty
-leftover). The service is `PipeFileService`, display name "Pipe File
+The default mount is `C:\ProgramData\PipeFileService\mount`. `--mount` names a folder that does not
+exist, or a drive letter; the service prepares the folder itself (WinFsp needs a mount folder that does
+not exist and Dokan one that exists and is empty, see [Backends](#backends-winfsp-or-dokan)). The service is `PipeFileService`, display name "Pipe File
 Service", runs as LocalSystem with a minimal privilege list
 (`SeCreateSymbolicLinkPrivilege`, `SeImpersonatePrivilege`, `SeChangeNotifyPrivilege`)
 and is started on demand, or at every boot with `install --auto-start`. It writes
@@ -223,30 +230,32 @@ path later:
 
 ### Install
 
-The service needs WinFsp installed, but it is safe to install it on a machine
-that does not have WinFsp (for example from an app installer that fetches WinFsp
-later, only if the user agrees):
+The service needs its file system driver (WinFsp or Dokan, matching the exe) installed, but it is safe to
+install the service on a machine that does not have the driver (for example from an app installer that
+fetches the driver later, only if the user agrees):
 
-- **At start, WinFsp missing:** the service logs one line to `service.log`, opens
-  **no control pipe**, and stops with exit code 0. The Service Control Manager
-  logs no failure and runs no recovery action. The start type is left alone, so
-  with `install --auto-start` it tries again at every boot. Nothing polls and
-  nothing listens while WinFsp is missing: **the control pipe does not exist until
-  WinFsp is installed and the service is started.**
-- **After installing WinFsp:** start the service again with an elevated
+- **At start, driver missing:** the service logs one line to `service.log` ("WinFsp is not installed" or
+  "Dokan is not installed"), opens **no control pipe**, and stops with exit code 0. The Service Control
+  Manager logs no failure and runs no recovery action. The start type is left alone, so with
+  `install --auto-start` it tries again at every boot. Nothing polls and nothing listens while the driver
+  is missing: **the control pipe does not exist until the driver is installed and the service is started.**
+- **After installing the driver:** start the service again with an elevated
   `sc start PipeFileService` (or reboot). There is no wake-up message.
-- **WinFsp removed while the service runs:** `register` answers
+- **Driver removed while the service runs:** `register` answers
   `driver_not_installed` and registers nothing. Registrations that already exist
   are left alone; they stop working by themselves (reads fail) and are cleaned up
   when their connection closes or the service stops.
-- "WinFsp is installed" means: the registry `InstallDir` under
+- "The driver is installed" means, for WinFsp: the registry `InstallDir` under
   `HKLM\SOFTWARE\WOW6432Node\WinFsp` has `bin\winfsp-x64.dll`, and a `WinFsp` file system
-  driver service is registered (WinFsp 2.x names it `WinFsp+<timestamp>`). The check
-  loads no WinFsp code.
-- For tests, `run --winfsp-dir <folder>` makes the check look for
-  `<folder>\bin\winfsp-x64.dll` instead. It exists only in `run` mode.
+  driver service is registered (WinFsp 2.x names it `WinFsp+<timestamp>`). For Dokan: `dokan2.dll` is in the
+  system folder and the `Dokan2` file system driver service exists. The check loads no driver code.
+- For tests, `run --winfsp-dir <folder>` (WinFsp build) makes the check look for
+  `<folder>\bin\winfsp-x64.dll` instead, and `run --dokan-dir <folder>` (Dokan build) for
+  `<folder>\dokan2.dll`. They exist only in `run` mode.
 
-### Installing WinFsp silently (for an installer or app)
+### Installing a driver silently (for an installer or app)
+
+#### WinFsp
 
 Use the unmodified WinFsp installer from the WinFsp project (verify its SHA-256
 and its Authenticode signature, signer `NAVIMATICS LLC`, before running it). From
@@ -281,11 +290,43 @@ msiexec /x {product-code} /qn /norestart /l*v C:\path\winfsp-uninstall.log
 `tests\install-chain.ps1` runs this whole sequence on a clean VM.
 
 The WinFsp installer also installs and starts
-`WinFsp.Launcher`, a separate service this project does not use. The service does not
-use a restricted service SID: that makes the token write-restricted and it then
+`WinFsp.Launcher`, a separate service this project does not use.
+
+#### Dokan
+
+Use the unmodified installer from the Dokan project (verify its SHA-256 and its Authenticode signature
+before running it; the 2.3.1.1000 installer is signed by `LEOSAC`). From an elevated process:
+
+```
+msiexec /i Dokan_x64.msi /qn /norestart /l*v C:\path\dokan-install.log
+```
+
+Exit codes: `0` success (no restart was needed), `3010` success and a restart is requested. The installer puts
+the `Dokan2` driver service (started, automatic) in place, `dokan2.dll` in the system folder and under
+`Program Files\Dokan`, and sets the machine variable `DokanLibrary2`. Developer files are off by default.
+Afterwards check that `dokan2.dll` is in the system folder and that `sc query Dokan2` shows it running.
+Then `sc start PipeFileService`.
+
+Uninstall: find the product code as the key under
+`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall` whose `DisplayName` starts with
+"Dokan Library", then:
+
+```
+msiexec /x {product-code} /qn /norestart /l*v C:\path\dokan-uninstall.log
+```
+
+It exits `3010`, and Windows keeps the driver service until the next restart. **The Dokan installer refuses to
+install again until that restart**, so an installer that removes and reinstalls Dokan needs a restart in
+between.
+
+`tests\install-chain.ps1 -Backend dokan` runs the same sequence for Dokan.
+
+#### Both
+
+The service does not use a restricted service SID: that makes the token write-restricted and it then
 cannot create its folder or reopen a user's placeholder.
 
-Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated;
+Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated and take `-Backend winfsp|dokan`;
 `tests\service-smoke.ps1` runs as an ordinary user, the realistic caller):
 
 ```powershell
@@ -294,36 +335,43 @@ Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated;
 .\tests\service-down.ps1      # elevated: stop + uninstall + check nothing is left
 ```
 
-`tests\limits.ps1` (unelevated, service running) checks the control-pipe limits.
+`tests\limits.ps1` (unelevated, service running) checks the control-pipe limits. `tests\slow-read.ps1`
+(unelevated, service running) checks that a read waiting 20 seconds for the data server succeeds and the
+volume stays mounted.
 `tests\exit-codes.ps1` checks that the test scripts end with an explicit `exit`, so a passing run
 reports exit code 0 even when started with `&` or from a CI step.
-`tests\driver-missing.ps1` checks the WinFsp-missing behaviour with `--winfsp-dir`
-(the first part runs unelevated; the rest needs an elevated shell and no running
-service). `tests\install-chain.ps1` is for a clean VM (elevated): service installed
-before WinFsp, WinFsp installed silently, WinFsp removed again.
+`tests\driver-missing.ps1 -Backend winfsp|dokan` checks the driver-missing behaviour with `--winfsp-dir` or
+`--dokan-dir` (the first part runs unelevated; the rest needs an elevated shell and no running
+service). `tests\install-chain.ps1 -Backend winfsp|dokan -DriverInstaller <msi>` is for a clean VM (elevated):
+service installed before the driver, driver installed silently, driver removed again; `-RemoveExisting`
+uninstalls a driver that is already installed first (Dokan then needs a restart before it can be installed
+again, and the script says so).
 
 ## Build
 
 Requires the Visual Studio C++ x64 build tools (`build.ps1` finds them itself)
-and the WinFsp SDK (headers and import library):
+and the SDK of each driver you build for:
 
 ```powershell
-.\build.ps1                              # uses an installed WinFsp (Developer feature)
-.\scripts\get-winfsp-sdk.ps1             # or fetch just the SDK, no driver install
+.\build.ps1                              # WinFsp programs, using an installed WinFsp (Developer feature)
+.\scripts\get-winfsp-sdk.ps1             # or fetch just the WinFsp SDK, no driver install
 .\build.ps1 -WinFsp .\.winfsp-sdk\DYNAMIC
+.\scripts\get-dokan-sdk.ps1              # fetch the Dokan headers and import library, no driver install
+.\build.ps1 -Backend dokan               # Dokan programs (uses .\.dokan-sdk)
+.\build.ps1 -Backend all -WinFsp .\.winfsp-sdk\DYNAMIC   # both
 ```
 
 `get-winfsp-sdk.ps1` downloads a pinned WinFsp release MSI, checks its SHA-256 and
-extracts it without installing anything. The result links the C runtime
-statically (no Visual C++ redistributable) and loads `winfsp-x64.dll` at run
-time from the installed WinFsp, printing "WinFsp is not installed" if it is
-missing. `pipe-file-mount-winfsp.exe --version` works without WinFsp. The same script builds
-`PipeFileService.exe`.
+extracts it without installing anything. The programs link the C runtime
+statically (no Visual C++ redistributable) and load their driver's DLL
+(`winfsp-x64.dll` or `dokan2.dll`) at run time, printing "WinFsp is not installed" or
+"Dokan is not installed" if it is missing. `--version` works without the driver.
 
-`PipeFileService.exe` is built from two parts: `src\pfs_core.c` (control pipe, registrations, limits,
+Each service exe is built from two parts: `src\pfs_core.c` (control pipe, registrations, limits,
 placeholder links, fetch on first read, service install) and one file system driver backend
-(`src\pfs_backend_winfsp.c`), joined by the interface in `src\pfs_backend.h`. A build links exactly
-one backend, so the exe references exactly one driver.
+(`src\pfs_backend_winfsp.c` or `src\pfs_backend_dokan.c`), joined by the interface in
+`src\pfs_backend.h`. The mount tool has the same shape (`src\pfm_core.c`, `src\pfm_backend_*.c`,
+`src\pfm_backend.h`). A build links exactly one backend, so each exe references exactly one driver.
 
 ### Backends: WinFsp or Dokan
 
@@ -396,15 +444,17 @@ drive letter (default `K`):
 ## Findings so far
 
 - Works with `Get-Content`, `cmd /c type`, Python and Node.
-- The caller's PID and image path are available in `Open` only; `Read` sees
-  PID 0. The programs therefore record the caller in `Open` and use it at the
+- WinFsp reports the caller's PID and image path in `Open` only; `Read` sees
+  PID 0. Dokan reports it on every request (cleanup and close can show pid 4, System, so only the
+  open is used). Both programs therefore record the caller in `Open` and use it at the
   first `Read`.
 - Programs open a file several times with attribute-only access (0x80) before the
   data open, and some open with read access (for example 0x00120089, a plain
   read open) and close without reading. Fetching at the first read keeps those
-  away from the server. WinFsp still delivers reads when the reported size is 0,
+  away from the server. Both drivers still deliver reads when the reported size is 0,
   so real readers get their data.
-- Measured with a counting server (Windows 11, mount tool on a drive letter): a
+- Measured with a counting server (Windows 11, WinFsp mount tool on a drive letter; the Dokan mount tool
+  passes the same fetch-on-first-read test): a
   directory listing (`Get-ChildItem`, `dir`), `Get-Item`, `Test-Path`,
   `FileInfo.Length`, `File.Exists`, `icacls`, `attrib`, a read-open that closes
   without reading, and `Copy-Item` (CopyFile) cause no fetch. Reading programs
@@ -421,23 +471,33 @@ drive letter (default `K`):
   one, so copy by reading (`Get-Content`, a stream) instead.
 - WinFsp refuses to dispatch creates unless the interface table has `Create`
   and `Overwrite`, even for a read-only volume (here they refuse writes).
-- `FileSystemName` holds 16 wide characters including the terminator; a longer
+- WinFsp's `FileSystemName` holds 16 wide characters including the terminator; a longer
   name makes the CRT fast-fail (`0xC0000409`) with no message.
+- Dokan: the directory fill function always returns 0 whether or not the entry was taken, so its
+  return value must not be read as "buffer full". An open request that stays pending longer than the
+  volume's timeout unmounts the whole volume. Dokan does not enforce per-file permissions
+  (see [Backends](#backends-winfsp-or-dokan)).
 - The volume's security descriptor allows only the current user and SYSTEM, so
   other users cannot trigger reads through the mount tool.
 
 ## Not done
 
-Defender/indexer behaviour, an installer (the service is not packaged, signed or chained with WinFsp), and a share of the volume across users beyond what is described above.
+Defender/indexer behaviour; an installer (the programs are not packaged as an installer or signed, and neither driver is chained into one); a run of `tests\install-chain.ps1` on a clean VM; testing with a second interactive user; and a share of the volume across users beyond what is described above.
 
 ## Licensing
 
-MIT (see `LICENSE`). This program links to the WinFsp DLL under WinFsp's
-[FLOSS exception](https://github.com/winfsp/winfsp/blob/master/License.txt):
-it must stay under an open-source licence and must not be linked or
-distributed together with proprietary software. Distribute WinFsp itself only
-as the unmodified installer released by the WinFsp project.
+This project's own code is MIT licensed (see `LICENSE`). The two file system drivers have their own licences, and
+each applies only to the programs built for that driver.
 
-The Dokan build uses [Dokan](https://github.com/dokan-dev/dokany) (Dokany) 2.x. Its user-mode library
-(`dokan2.dll`) and driver are LGPL licensed; this program loads the library dynamically and does not contain
-it. Distribute Dokan itself only as the unmodified installer released by the Dokan project.
+**WinFsp builds** (`PipeFileService-winfsp.exe`, `pipe-file-mount-winfsp.exe`) link to the WinFsp DLL under
+WinFsp's [FLOSS exception](https://github.com/winfsp/winfsp/blob/master/License.txt): they must stay under an
+open-source licence and must not be linked or distributed together with proprietary software. Distribute
+WinFsp itself only as the unmodified installer released by the WinFsp project.
+
+> WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
+> https://github.com/winfsp/winfsp
+
+**Dokan builds** (`PipeFileService-dokan.exe`, `pipe-file-mount-dokan.exe`) do not use WinFsp. They use
+[Dokan](https://github.com/dokan-dev/dokany) (Dokany) 2.x. Its user-mode library (`dokan2.dll`) and driver
+are LGPL licensed; these programs load the library dynamically and do not contain it. Distribute Dokan itself
+only as the unmodified installer released by the Dokan project.
