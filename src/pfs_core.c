@@ -24,6 +24,7 @@
 #define MAX_SUFFIX 64
 #define MAX_PATHW 1024
 #define MAX_MSG 65536
+#define MAX_DECLARED_SIZE (1ull << 30)   // largest `size` a registration may declare (1 GiB)
 
 // Limits on the control pipe, which every interactive user can open. The defaults can be changed with
 // `install --max-...` (kept in the service's Parameters key) or `run --max-...`; see usage().
@@ -58,6 +59,7 @@ typedef struct Entry {
     WCHAR name[MAX_NAME + 1];          // the file name on the volume
     WCHAR pipe[MAX_PIPE + 1];          // the data pipe
     WCHAR info_pipe[MAX_PIPE + MAX_SUFFIX + 1]; // pipe + suffix; empty = read the data pipe directly
+    BOOL has_size; UINT64 size;        // the size the registrant declared; the content must be exactly this long
     PSECURITY_DESCRIPTOR sd; SIZE_T sdsz;
     Conn *conn;
     HANDLE link;                       // handle on the symlink this entry made, or NULL
@@ -426,6 +428,7 @@ typedef struct {
     BOOL want_data;                       // opened with read access
     Conn *conn;                           // reference held while want_data and not yet fetched
     WCHAR fname[MAX_NAME + 1], pipe[MAX_PIPE + 1], info[MAX_PIPE + MAX_SUFFIX + 1];
+    BOOL has_size; UINT64 size;           // declared at registration (see Entry)
     UINT32 pid; UINT64 start; HANDLE proc;
     SRWLOCK lock; BOOL done; NTSTATUS result;
 } Ctx;
@@ -456,7 +459,7 @@ void pfs_log(const char *fmt, ...)
 static void fill_info(const Ctx *c, PfsInfo *i)
 {
     i->dir = c->root;
-    i->size = c->root ? 0 : c->len;
+    i->size = c->root ? 0 : (c->has_size ? c->size : c->len);
     i->id = c->id;
     i->time = g_now;
 }
@@ -504,7 +507,15 @@ static NTSTATUS ensure_data(Ctx *c)
         logf_("FETCH %ls pid=%u", c->fname, c->pid);
         NTSTATUS st = c->info[0] ? fetch_forwarded(c->conn->token, c->info, c->pid, c->start, &c->data, &c->len)
                                  : fetch_direct(c->conn->token, c->pipe, &c->data, &c->len);
-        if (NT_SUCCESS(st)) send_event(c->conn, "opened", c->fname, c->pid, NULL);
+        if (NT_SUCCESS(st) && c->has_size && c->len != c->size) {
+            // The file already reported its declared size; padding or cutting the secret would hand the reader
+            // a wrong one, so the read fails instead.
+            logf_("  the server sent %zu bytes but %llu were declared", c->len, (unsigned long long)c->size);
+            if (c->data) { SecureZeroMemory(c->data, c->len); free(c->data); c->data = NULL; }
+            c->len = 0;
+            st = STATUS_IO_DEVICE_ERROR;
+            send_event(c->conn, "error", c->fname, c->pid, "size_mismatch");
+        } else if (NT_SUCCESS(st)) send_event(c->conn, "opened", c->fname, c->pid, NULL);
         else send_event(c->conn, st == STATUS_ACCESS_DENIED ? "denied" : "error", c->fname, c->pid, NULL);
         logf_("  -> 0x%08x, %zu bytes", (unsigned)st, c->len);
         c->result = st; c->done = TRUE;
@@ -526,6 +537,7 @@ NTSTATUS pfs_open(const WCHAR *name, UINT32 access, UINT32 pid, void **pfile, Pf
     Entry *e = (name[0] == L'\\' && !wcschr(name + 1, L'\\')) ? find_by_name(name + 1) : NULL;
     if (e) {
         c->id = e->id;
+        c->has_size = e->has_size; c->size = e->size;
         c->sd = malloc(e->sdsz); memcpy(c->sd, e->sd, e->sdsz); c->sdsz = e->sdsz;
         wcscpy_s(fname, MAX_NAME + 1, e->name); wcscpy_s(pipe, MAX_PIPE + 1, e->pipe);
         wcscpy_s(infop, MAX_PIPE + MAX_SUFFIX + 1, e->info_pipe);
@@ -753,6 +765,18 @@ static void do_register(Conn *c, const Json *j, const WCHAR *id)
     if (suffix && (wcslen(suffix) == 0 || wcslen(suffix) > MAX_SUFFIX || wcschr(suffix, L'\\') || wcschr(suffix, L'/'))) {
         send_reply(c, id, "error", "bad_request", "reader_info_suffix must be 1 to 64 characters without a path separator", NULL, -1); return;
     }
+    const WCHAR *size_text = jget(j, L"size");
+    BOOL has_size = FALSE; UINT64 size = 0;
+    if (size_text) {
+        BOOL digits = size_text[0] >= L'0' && size_text[0] <= L'9';
+        for (const WCHAR *q = size_text; *q && digits; q++) digits = (*q >= L'0' && *q <= L'9');
+        if (digits) size = _wcstoui64(size_text, NULL, 10);
+        if (!digits || wcslen(size_text) > 19 || size > MAX_DECLARED_SIZE) {
+            char m[128]; snprintf(m, sizeof m, "size must be a whole number of bytes from 0 to %llu", (unsigned long long)MAX_DECLARED_SIZE);
+            send_reply(c, id, "error", "bad_request", m, NULL, -1); return;
+        }
+        has_size = TRUE;
+    }
     // The caller must be able to reach the pipe it registers (checked as the caller; only the pipe that will be read).
     Entry *e = (Entry *)calloc(1, sizeof *e);
     wcscpy_s(e->pipe, MAX_PIPE + 1, pipe);
@@ -763,6 +787,7 @@ static void do_register(Conn *c, const Json *j, const WCHAR *id)
         send_reply(c, id, "error", "pipe_unreachable", m, NULL, -1); free(e); return;
     }
     wcscpy_s(e->name, MAX_NAME + 1, name);
+    e->has_size = has_size; e->size = size;
     e->conn = c;
     if (link) {
         if (g_mount[0] == 0) { send_reply(c, id, "error", "link_failed", "no mount", NULL, -1); free(e); return; }
