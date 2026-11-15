@@ -6,7 +6,7 @@
 #
 #   1. every test script ends with an explicit `exit` (needs nothing installed);
 #   2. driver-missing.ps1, which deliberately runs a command that exits with 2, still exits with 0 when it passes
-#      (needs a built PipeFileService-winfsp.exe; skipped without it).
+#      (once for each built PipeFileService-winfsp.exe / PipeFileService-dokan.exe; skipped for one that is not built).
 $ErrorActionPreference = 'Stop'
 $script:failures = 0
 function Check($name, $ok, $detail) {
@@ -18,14 +18,16 @@ foreach ($name in 'driver-missing', 'limits', 'smoke', 'lazy-fetch', 'service-sm
     Check "$name.ps1 ends with an explicit exit" ($lines[-1] -match '^\s*exit\b') $lines[-1]
 }
 
-$exe = Join-Path $PSScriptRoot '..\PipeFileService-winfsp.exe'
-if (-not (Test-Path $exe)) {
-    'SKIP  driver-missing.ps1 exit code: build PipeFileService-winfsp.exe first'
-} else {
+foreach ($backend in 'winfsp', 'dokan') {
+    $exe = Join-Path $PSScriptRoot "..\PipeFileService-$backend.exe"
+    if (-not (Test-Path $exe)) {
+        "SKIP  driver-missing.ps1 exit code ($backend): build PipeFileService-$backend.exe first"
+        continue
+    }
     $script = Join-Path $PSScriptRoot 'driver-missing.ps1'
     # The same way a CI step runs a script: call it, then exit with the last native exit code.
-    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& '$script' | Out-Null; exit `$LASTEXITCODE"
-    Check 'driver-missing.ps1 exits with 0 when it passes (run with & and -Command)' ($LASTEXITCODE -eq 0) "exit code $LASTEXITCODE"
+    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& '$script' -Backend $backend | Out-Null; exit `$LASTEXITCODE"
+    Check "driver-missing.ps1 ($backend) exits with 0 when it passes (run with & and -Command)" ($LASTEXITCODE -eq 0) "exit code $LASTEXITCODE"
 }
 
 if ($script:failures) { "$($script:failures) FAILED"; exit 1 } else { 'ALL PASSED' }
