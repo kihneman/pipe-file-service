@@ -6,6 +6,8 @@ $ErrorActionPreference = 'Stop'
 $base = "pfs-idle-$PID"
 $content = "KEY=value`n"; $len = [Text.Encoding]::UTF8.GetByteCount($content)
 $script:failures = 0
+    else { Check $name (Wait-Mount $false $seconds) "mount still at $Mount" }
+}
 function Check($name, $ok, $detail) {
     if ($ok) { "PASS  $name" } else { "FAIL  $name   $detail"; $script:failures++ }
 }

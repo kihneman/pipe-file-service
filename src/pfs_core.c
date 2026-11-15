@@ -762,13 +762,42 @@ static void remove_entry_locked(Entry *e)   // g_lock held
 // failed to start; it logged why).
 #define MOUNT_NOT_INSTALLED 1
 #define MOUNT_FAILED 2
+// The backend is only ever called from one long-lived thread. Starting it from a connection thread, which ends when its
+// client goes away, crashed Dokan later (its start leaves work tied to the calling thread); every start and stop runs here.
+static CRITICAL_SECTION g_bk_lock;
+static HANDLE g_bk_req, g_bk_done, g_bk_quit;
+static int (*g_bk_fn)(void);
+static int g_bk_rc;
+
+static DWORD WINAPI backend_thread(LPVOID arg)
+{
+    (void)arg;
+    HANDLE w[2] = { g_bk_req, g_bk_quit };
+    while (WaitForMultipleObjects(2, w, FALSE, INFINITE) == WAIT_OBJECT_0) { g_bk_rc = g_bk_fn(); SetEvent(g_bk_done); }
+    return 0;
+}
+
+static int on_backend_thread(int (*fn)(void))
+{
+    EnterCriticalSection(&g_bk_lock);
+    g_bk_fn = fn;
+    SetEvent(g_bk_req);
+    WaitForSingleObject(g_bk_done, INFINITE);
+    int rc = g_bk_rc;
+    LeaveCriticalSection(&g_bk_lock);
+    return rc;
+}
+
+static int bk_start(void) { return pfs_backend.start(g_mount); }
+static int bk_stop(void) { pfs_backend.stop(); return 0; }
+
 static int mount_now(void)
 {
     int rc = 0;
     EnterCriticalSection(&g_mount_lock);
     if (!g_mounted) {
         if (!pfs_backend.installed()) rc = MOUNT_NOT_INSTALLED;
-        else if (pfs_backend.start(g_mount)) { logf_("could not mount on %ls", g_mount); rc = MOUNT_FAILED; }
+        else if (on_backend_thread(bk_start)) { logf_("could not mount on %ls", g_mount); rc = MOUNT_FAILED; }
         else { g_mounted = TRUE; logf_("mounted on %ls", g_mount); }
     }
     LeaveCriticalSection(&g_mount_lock);
@@ -778,7 +807,7 @@ static int mount_now(void)
 static void unmount_now(void)
 {
     EnterCriticalSection(&g_mount_lock);
-    if (g_mounted) { pfs_backend.stop(); g_mounted = FALSE; logf_("unmounted"); }
+    if (g_mounted) { on_backend_thread(bk_stop); g_mounted = FALSE; logf_("unmounted"); }
     LeaveCriticalSection(&g_mount_lock);
 }
 
@@ -804,7 +833,7 @@ static int count_entries(void)
 static void unmount_if_idle(void)
 {
     EnterCriticalSection(&g_mount_lock);
-    if (g_mounted && count_entries() == 0 && open_handles() == 0) { pfs_backend.stop(); g_mounted = FALSE; logf_("unmounted (idle)"); }
+    if (g_mounted && count_entries() == 0 && open_handles() == 0) { on_backend_thread(bk_stop); g_mounted = FALSE; logf_("unmounted (idle)"); }
     LeaveCriticalSection(&g_mount_lock);
 }
 
@@ -1161,7 +1190,10 @@ static int serve(const WCHAR *mount)
 {
     InitializeCriticalSection(&g_lock);
     InitializeCriticalSection(&g_mount_lock);
+    InitializeCriticalSection(&g_bk_lock);
     g_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_bk_req = CreateEventW(NULL, FALSE, FALSE, NULL); g_bk_done = CreateEventW(NULL, FALSE, FALSE, NULL); g_bk_quit = CreateEventW(NULL, TRUE, FALSE, NULL);
+    HANDLE bk = CreateThread(NULL, 0, backend_thread, NULL, 0, NULL);
     wcscpy_s(g_mount, MAX_PATHW, mount);
     size_t ml = wcslen(g_mount);
     while (ml > 3 && g_mount[ml - 1] == L'\\') g_mount[--ml] = 0;
@@ -1196,6 +1228,7 @@ static int serve(const WCHAR *mount)
     LeaveCriticalSection(&g_lock);
     WaitForSingleObject(mt, 5000); CloseHandle(mt);
     unmount_now();
+    SetEvent(g_bk_quit); WaitForSingleObject(bk, 5000); CloseHandle(bk);
     logf_("stopped");
     return 0;
 }
