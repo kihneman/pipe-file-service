@@ -180,17 +180,31 @@ static BOOL parse_run_option(const WCHAR *flag, const WCHAR *value)
     return TRUE;
 }
 
+static BOOL running_as_system(void)
+{
+    HANDLE tok; BYTE buf[256]; DWORD n = 0; BYTE sys[SECURITY_MAX_SID_SIZE]; DWORD sn = sizeof sys; BOOL yes = FALSE;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return FALSE;
+    if (GetTokenInformation(tok, TokenUser, buf, sizeof buf, &n) && CreateWellKnownSid(WinLocalSystemSid, NULL, sys, &sn))
+        yes = EqualSid(((TOKEN_USER *)buf)->User.Sid, sys);
+    CloseHandle(tok);
+    return yes;
+}
+
 static int start(const WCHAR *mount)
 {
     if (projfs_is_drive_mount(mount)) { pfs_log("the ProjFS build serves a folder, not a drive letter: use --mount <folder>"); return 14; }
     wcscpy_s(g_root, MAX_PATHW, mount);
     InitializeCriticalSection(&g_enum_lock);
 
+    // No owner in the descriptor: the creator owns the folder (naming another owner needs a privilege that `run` in an
+    // elevated console does not have).
     // Start from an empty folder we own: whatever a previous run left (hydrated files, a stale ProjFS root) is removed.
     projfs_make_parents(mount);
     projfs_remove_tree(mount, TRUE);
     PSECURITY_DESCRIPTOR sd = NULL;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;AU)", SDDL_REVISION_1, &sd, NULL)) {
+    // The service is SYSTEM, which the descriptor names already. Only a development `run` as another account adds OWNER RIGHTS.
+    const WCHAR *sddl = running_as_system() ? L"D:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;AU)" : L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)(A;OICI;FRFX;;;AU)";
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, NULL)) {
         pfs_log("cannot build the folder security descriptor: %lu", GetLastError()); return 12;
     }
     SECURITY_ATTRIBUTES sa = { sizeof sa, sd, FALSE };
