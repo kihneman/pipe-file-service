@@ -1,5 +1,5 @@
-# Builds the release zips and checksums into dist\: one zip per file system driver, so a download
-# carries the programs of exactly one driver.
+# Builds the release zips and checksums into dist\: one zip per backend (WinFsp, Dokan, ProjFS), so a download
+# carries the programs of exactly one backend.
 #   .\scripts\release.ps1                      # local build, version from the source
 #   .\scripts\release.ps1 -Tag v0.1.0          # also checks the tag matches the source version
 #   .\scripts\release.ps1 -Tag v0.1.0-rc.1     # a pre-release tag: version plus a suffix
@@ -9,9 +9,10 @@
 # dist\ gets:
 #   pipe-file-service-<version>-winfsp-windows-x64.zip   PipeFileService-winfsp.exe, pipe-file-mount-winfsp.exe
 #   pipe-file-service-<version>-dokan-windows-x64.zip    PipeFileService-dokan.exe, pipe-file-mount-dokan.exe
-#   SHA256SUMS                                           both zips
+#   pipe-file-service-<version>-projfs-windows-x64.zip   PipeFileService-projfs.exe, pipe-file-mount-projfs.exe
+#   SHA256SUMS                                           the three zips
 #   RELEASE_NOTES.md                                     includes the SHA-256 of every exe
-#   exe\*.exe                                            the four exes, for the build attestation (not published as assets)
+#   exe\*.exe                                            the six exes, for the build attestation (not published as assets)
 param(
     [string]$Tag = '',
     [string]$WinFsp = 'C:\Program Files (x86)\WinFsp',
@@ -41,7 +42,8 @@ if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) { throw "build.ps1 failed 
 
 $backends = @(
     @{ Key = 'winfsp'; Title = 'WinFsp' },
-    @{ Key = 'dokan'; Title = 'Dokan' }
+    @{ Key = 'dokan'; Title = 'Dokan' },
+    @{ Key = 'projfs'; Title = 'ProjFS' }
 )
 if (Test-Path $Out) { Remove-Item $Out -Recurse -Force }
 New-Item -ItemType Directory $Out, (Join-Path $Out 'exe') | Out-Null
@@ -79,19 +81,28 @@ foreach ($b in $backends) {
 
 $winfspZip = $zipNames['winfsp']
 $dokanZip = $zipNames['dokan']
+$projfsZip = $zipNames['projfs']
 $notes = @"
 pipe-file-service $releaseVersion (experimental, Windows x64)
 
-Shows a Windows named pipe as a read-only file: ``pipe-file-mount-<driver>.exe`` does it for one pipe in
-one process; ``PipeFileService-<driver>.exe`` is a Windows service that does it for any local user's app and
-can link placeholder files to the pipes (see the README). It runs on a file system driver, and there is one
-download per driver. Each executable references exactly one driver, and the driver is not included.
-The service name (``PipeFileService``) and its control pipe are the same for both.
+Shows a Windows named pipe as a read-only file: ``pipe-file-mount-<backend>.exe`` does it for one pipe in
+one process; ``PipeFileService-<backend>.exe`` is a Windows service that does it for any local user's app and
+can link placeholder files to the pipes (see the README). There is one download per backend: WinFsp or Dokan
+(a user-mode file system driver you install separately) or ProjFS (the Windows Projected File System, a Windows
+feature, no third-party driver). Each executable references exactly one backend, and no driver is included.
+The service name (``PipeFileService``) and its control pipe are the same for all three.
 
-| download | driver you install separately |
+| download | what you install separately |
 |---|---|
 | ``$winfspZip.zip`` | WinFsp: https://github.com/winfsp/winfsp/releases |
 | ``$dokanZip.zip`` | Dokan 2.x: https://github.com/dokan-dev/dokany/releases |
+| ``$projfsZip.zip`` | nothing to download: enable the Windows feature ``Client-ProjFS`` |
+
+**The ProjFS download does not keep the other two's guarantee that the secret is never written to disk.** ProjFS
+projects into a real folder, so the content is written there while it is read (it is deleted when the reading
+handle closes, not always before another reader opens it, and a crash leaves it until the next start), and the
+files take the folder's access control. Registrations need a ``size``. Read the ProjFS section of the README before
+choosing it.
 
 **The binaries are not Authenticode-signed**, so Windows SmartScreen may warn. Check the zips against
 ``SHA256SUMS``. SHA-256 of the programs inside the zips:
@@ -117,8 +128,8 @@ to install again until then.
 > Dokan (Dokany), https://github.com/dokan-dev/dokany
 
 The WinFsp programs link to the WinFsp DLL under WinFsp's FLOSS exception; do not combine them with
-proprietary software. The Dokan programs load Dokan's LGPL library dynamically and do not contain it. This
-project is MIT licensed.
+proprietary software. The Dokan programs load Dokan's LGPL library dynamically and do not contain it. The ProjFS
+programs use only the Windows Projected File System API of Windows itself. This project is MIT licensed.
 "@
 # No byte-order mark: Windows PowerShell's -Encoding utf8 would add one.
 [IO.File]::WriteAllText((Join-Path $Out 'RELEASE_NOTES.md'), $notes, (New-Object Text.UTF8Encoding($false)))

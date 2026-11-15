@@ -52,7 +52,7 @@ jobs:
         run: |
           $tag = $env:GITHUB_REF_NAME
           $zips = @(Get-ChildItem dist -Filter *.zip | ForEach-Object FullName)
-          if ($zips.Count -ne 2) { throw "expected two zips, found $($zips.Count)" }
+          if ($zips.Count -ne 3) { throw "expected three zips, found $($zips.Count)" }
           $ghArgs = @($tag) + $zips + @('dist/SHA256SUMS', '--title', "pipe-file-service $($tag.Substring(1))", '--notes-file', 'dist/RELEASE_NOTES.md', '--verify-tag')
           if ($tag -match '-') { $ghArgs += '--prerelease' }
           gh release create @ghArgs

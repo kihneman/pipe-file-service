@@ -20,6 +20,7 @@
 #define CHUNK (1u << 20)   // bytes written to ProjFS per call (a multiple of any sector size)
 
 static WCHAR g_root[MAX_PATHW];
+static WCHAR g_projfs_dir[MAX_PATHW];   // development override (run mode only); empty = the real system folder
 static PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT g_ctx;
 
 // "name" (ProjFS path, no leading backslash) -> "\name" (the core's path). FALSE for anything but a top-level name.
@@ -169,7 +170,15 @@ static HRESULT CALLBACK Notify(const PRJ_CALLBACK_DATA *d, BOOLEAN dir, PRJ_NOTI
 
 // ---------------------------------------------------------------- serving
 
-static BOOL installed(void) { return projfs_installed(); }
+static BOOL installed(void) { return projfs_installed(g_projfs_dir); }
+
+// `--projfs-dir <folder>`: never read in service mode.
+static BOOL parse_run_option(const WCHAR *flag, const WCHAR *value)
+{
+    if (0 != wcscmp(flag, L"--projfs-dir") || !value[0]) return FALSE;
+    wcscpy_s(g_projfs_dir, MAX_PATHW, value);
+    return TRUE;
+}
 
 static int start(const WCHAR *mount)
 {
@@ -217,6 +226,8 @@ static void stop(void)
 
 const PfsBackend pfs_backend = {
     L"Windows Projected File System", "https://learn.microsoft.com/windows/win32/projfs/projected-file-system (enable the Windows feature Client-ProjFS)",
-    installed, start, stop, NULL, NULL, NULL,
+    installed, start, stop, parse_run_option,
+    L"--projfs-dir <folder>",
+    L"--projfs-dir makes the ProjFS check look for <folder>\\projectedfslib.dll instead of the real install",
     TRUE,   // requires_size
 };

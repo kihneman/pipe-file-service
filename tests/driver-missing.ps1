@@ -1,17 +1,22 @@
-# Tests how PipeFileService behaves when its driver (WinFsp or Dokan, see -Backend) is missing, without needing a
-# machine that lacks it: `run --winfsp-dir <folder>` / `run --dokan-dir <folder>` (a development switch that only
-# exists in run mode) makes the check look for <folder>\bin\winfsp-x64.dll / <folder>\dokan2.dll instead of the real install.
+# Tests how PipeFileService behaves when its driver (WinFsp, Dokan or ProjFS, see -Backend) is missing, without needing a
+# machine that lacks it: `run --winfsp-dir <folder>` / `run --dokan-dir <folder>` / `run --projfs-dir <folder>` (a development
+# switch that only exists in run mode) makes the check look for <folder>\bin\winfsp-x64.dll / <folder>\dokan2.dll /
+# <folder>\projectedfslib.dll instead of the real install.
 #
 #   missing at start-up   exit code 0, a log line, no control pipe        (runs unelevated)
 #   gone at register      `register` answers driver_not_installed          (needs an ELEVATED shell and the
 #   present at start-up   the control pipe exists and registration works    real driver: it really mounts a volume)
 #
 # Run it from Windows PowerShell 5.1. -Exe selects the binary (the mutation check passes a broken build).
-param([string]$Backend = 'winfsp', [string]$Exe = (Join-Path $PSScriptRoot "..\PipeFileService-$Backend.exe"))
+param([ValidateSet('winfsp', 'dokan', 'projfs')][string]$Backend = 'winfsp', [string]$Exe = (Join-Path $PSScriptRoot "..\PipeFileService-$Backend.exe"))
 $ErrorActionPreference = 'Stop'
 $Exe = [IO.Path]::GetFullPath($Exe)
 # The driver-specific pieces: the name in messages, the development switch, and the file the switch looks for.
-$drv = if ($Backend -eq 'dokan') { @{ Name = 'Dokan'; Flag = '--dokan-dir'; Dll = 'dokan2.dll' } } else { @{ Name = 'WinFsp'; Flag = '--winfsp-dir'; Dll = 'bin\winfsp-x64.dll' } }
+$drv = switch ($Backend) {
+    'dokan' { @{ Name = 'Dokan'; Flag = '--dokan-dir'; Dll = 'dokan2.dll' } }
+    'projfs' { @{ Name = 'Windows Projected File System'; Flag = '--projfs-dir'; Dll = 'projectedfslib.dll' } }
+    default { @{ Name = 'WinFsp'; Flag = '--winfsp-dir'; Dll = 'bin\winfsp-x64.dll' } }
+}
 $work = Join-Path $env:TEMP "fsp-driver-missing-$PID"
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $work | Out-Null
@@ -97,6 +102,7 @@ if ($busy -or -not $elevated) {
         $data = New-Object IO.Pipes.NamedPipeServerStream("fsp-dm-$PID", 'Out', 4, 'Byte', 'Asynchronous')
         $c = New-Client
         $r = Req $c @{ type = 'register'; id = '1'; pipe = "\\.\pipe\fsp-dm-$PID"; file_name = 'a.env' }
+        if ($r.code -eq 'size_required') { $r = Req $c @{ type = 'register'; id = '1'; pipe = "\\.\pipe\fsp-dm-$PID"; file_name = 'a.env'; size = 1 } }   # the ProjFS build needs a size
         Check 'present: register works' ($r.status -eq 'ok') ($r | ConvertTo-Json -Compress)
         Remove-Item $dummy -Force   # the driver "disappears" while the service runs
         $r = Req $c @{ type = 'register'; id = '2'; pipe = "\\.\pipe\fsp-dm-$PID"; file_name = 'b.env' }
