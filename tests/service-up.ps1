@@ -4,7 +4,8 @@
 param(
     [string]$Backend = 'winfsp', [string]$Exe = (Join-Path $PSScriptRoot "..\PipeFileService-$Backend.exe"),
     [string]$Mount = 'C:\ProgramData\PipeFileService\mount',
-    [int]$IdleSeconds = 0   # > 0: install with --idle-seconds (tests\idle.ps1 wants a short grace period)
+    [int]$IdleSeconds = 0,   # > 0: install with --idle-seconds (tests\idle.ps1 wants a short grace period)
+    [string]$DisplayName, [string]$Description   # install with --display-name / --description
 )
 $ErrorActionPreference = 'Stop'
 $Exe = [IO.Path]::GetFullPath($Exe)
@@ -18,6 +19,8 @@ New-Item $adminOwned -ItemType File | Out-Null
 icacls $adminOwned /grant "*$($id.User.Value):(M)" | Out-Null
 $installArgs = @('install', '--mount', $Mount)
 if ($IdleSeconds -gt 0) { $installArgs += @('--idle-seconds', $IdleSeconds) }
+if ($DisplayName) { $installArgs += @('--display-name', $DisplayName) }
+if ($Description) { $installArgs += @('--description', $Description) }
 & $Exe @installArgs
 if ($LASTEXITCODE) { throw 'install failed' }
 Start-Service PipeFileService

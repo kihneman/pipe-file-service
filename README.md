@@ -112,7 +112,8 @@ In this README `PipeFileService.exe` stands for `PipeFileService-winfsp.exe`, `P
 or `pipe-file-mount-projfs.exe`.
 
 ```
-PipeFileService.exe install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [limits]   (elevated)
+PipeFileService.exe install [--mount <folder that does not exist, or a drive letter>] [--auto-start]
+                            [--display-name <text>] [--description <text>] [limits]   (elevated)
 PipeFileService.exe uninstall                                                                                  (elevated)
 PipeFileService.exe run [--mount <...>] [--winfsp-dir <folder> | --dokan-dir <folder> | --projfs-dir <folder>] [limits]    run in this console (elevated), for development
 ```
@@ -122,7 +123,9 @@ exist, or a drive letter; the service prepares the folder itself (WinFsp needs a
 not exist, Dokan one that exists and is empty, and the ProjFS build empties and recreates it, see [Backends](#backends-winfsp-dokan-or-projfs)). The service is `PipeFileService`, display name "Pipe File
 Service", runs as LocalSystem with a minimal privilege list
 (`SeCreateSymbolicLinkPrivilege`, `SeImpersonatePrivilege`, `SeChangeNotifyPrivilege`)
-and is started on demand, or at every boot with `install --auto-start`. It writes
+and is started on demand, or at every boot with `install --auto-start`. `--display-name` and `--description` set the
+label and the text shown in the Services list (defaults: "Pipe File Service" and a line naming the backend); the service itself
+is always `PipeFileService`, with the same control pipe and data folder, because clients and tools find it by that name. It writes
 `C:\ProgramData\PipeFileService\service.log`.
 
 ### Mounting on demand

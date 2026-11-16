@@ -1333,7 +1333,20 @@ static void remove_legacy_service(SC_HANDLE scm)
     }
 }
 
-static int install(const WCHAR *mount, BOOL auto_start)
+// The label in the Services list and the text under it. Only these two are configurable: the service name, the control pipe and
+// the data folder stay `PipeFileService`, because clients and tools find the service by them.
+#define MAX_DISPLAY 256
+#define MAX_DESCRIPTION 512
+
+static BOOL valid_label(const WCHAR *t, size_t max)
+{
+    size_t n = wcslen(t);
+    if (n == 0 || n > max) return FALSE;
+    for (const WCHAR *q = t; *q; q++) if (*q < 32) return FALSE;
+    return TRUE;
+}
+
+static int install(const WCHAR *mount, BOOL auto_start, const WCHAR *display, const WCHAR *description)
 {
     WCHAR exe[MAX_PATH], cmd[MAX_PATH + 16];
     GetModuleFileNameW(NULL, exe, MAX_PATH);
@@ -1341,11 +1354,12 @@ static int install(const WCHAR *mount, BOOL auto_start)
     SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (!scm) { fprintf(stderr, "cannot open the service manager (run elevated): %lu\n", GetLastError()); return 1; }
     remove_legacy_service(scm);
-    SC_HANDLE s = CreateServiceW(scm, SVC_NAME, SVC_DISPLAY, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
+    SC_HANDLE s = CreateServiceW(scm, SVC_NAME, display ? display : SVC_DISPLAY, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
         auto_start ? SERVICE_AUTO_START : SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, cmd, NULL, NULL, NULL, NULL, NULL);
     if (!s) { fprintf(stderr, "CreateService failed: %lu\n", GetLastError()); CloseServiceHandle(scm); return 1; }
-    WCHAR desc[160];
-    swprintf_s(desc, 160, L"Shows named pipes as read-only files on a %ls volume and links placeholder files to them.", pfs_backend.driver_name);
+    WCHAR desc[MAX_DESCRIPTION + 1];
+    if (description) wcscpy_s(desc, MAX_DESCRIPTION + 1, description);
+    else swprintf_s(desc, MAX_DESCRIPTION + 1, L"Shows named pipes as read-only files on a %ls volume and links placeholder files to them.", pfs_backend.driver_name);
     SERVICE_DESCRIPTIONW d = { desc };
     ChangeServiceConfig2W(s, SERVICE_CONFIG_DESCRIPTION, &d);
     // A restricted service SID makes the token write-restricted: the service then cannot create its
@@ -1393,7 +1407,9 @@ static int usage(void)
     if (pfs_backend.run_option_synopsis) swprintf_s(syn, 160, L" [%ls]", pfs_backend.run_option_synopsis);
     fwprintf(stderr,
         L"usage: PipeFileService <command>\n"
-        L"  install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [limits]   (elevated)\n"
+        L"  install [--mount <folder that does not exist, or a drive letter>] [--auto-start] [--display-name <text>]\n"
+        L"          [--description <text>] [limits]   (elevated; the name and description are the Services list labels,\n"
+        L"          the service itself stays PipeFileService)\n"
         L"  uninstall                                                           (elevated)\n"
         L"  run [--mount <...>]%ls [limits]   run in this console (elevated), for development;\n"
         L"  limits on the control pipe (defaults in brackets; install keeps them for the service):\n"
@@ -1432,16 +1448,19 @@ int wmain(int argc, wchar_t **argv)
     if (argc < 2) return usage();
     const WCHAR *mount = DEFAULT_MOUNT;
     BOOL auto_start = FALSE;
+    const WCHAR *display = NULL, *description = NULL;
     BOOL is_install = 0 == wcscmp(argv[1], L"install"), is_run = 0 == wcscmp(argv[1], L"run");
     if (0 == wcscmp(argv[1], L"uninstall") || 0 == wcscmp(argv[1], L"service")) { if (argc != 2) return usage(); }
     else for (int i = 2; i < argc; i++) {
         if (0 == wcscmp(argv[i], L"--mount") && i + 1 < argc && argv[i + 1][0]) mount = argv[++i];
         else if (is_install && 0 == wcscmp(argv[i], L"--auto-start")) auto_start = TRUE;
+        else if (is_install && 0 == wcscmp(argv[i], L"--display-name") && i + 1 < argc && valid_label(argv[i + 1], MAX_DISPLAY)) display = argv[++i];
+        else if (is_install && 0 == wcscmp(argv[i], L"--description") && i + 1 < argc && valid_label(argv[i + 1], MAX_DESCRIPTION)) description = argv[++i];
         else if (is_run && i + 1 < argc && pfs_backend.parse_run_option && pfs_backend.parse_run_option(argv[i], argv[i + 1])) i++;   // never read in service mode
         else if ((is_install || is_run) && i + 1 < argc && parse_limit_arg(argv[i], argv[i + 1])) i++;
         else return usage();
     }
-    if (is_install) return install(mount, auto_start);
+    if (is_install) return install(mount, auto_start, display, description);
     if (0 == wcscmp(argv[1], L"uninstall") && argc == 2) return uninstall();
     if (is_run) {
         g_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
