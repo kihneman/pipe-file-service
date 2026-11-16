@@ -125,6 +125,18 @@ Service", runs as LocalSystem with a minimal privilege list
 and is started on demand, or at every boot with `install --auto-start`. It writes
 `C:\ProgramData\PipeFileService\service.log`.
 
+### Mounting on demand
+
+The control pipe is up from the moment the service starts, whether or not the driver is installed. The volume (or the
+projected folder) is not: it is mounted when the first registration needs it and unmounted again after
+`--idle-seconds` (default 30) with no registration and no open handle on a served file. A client therefore never waits for
+the service to start, and nothing is mounted while nothing is registered. Every start and stop of the driver runs on one
+long-lived thread inside the service (Dokan 2.3.1 crashed when it was started from a connection thread that later ended).
+
+The folder that holds the mount and the log, `C:\ProgramData\PipeFileService`, is restricted when the service starts:
+SYSTEM and Administrators can write, users can only read. Otherwise a user could plant a file where the mount is about to
+appear while nothing is mounted. (If you move the mount with `--mount`, the folder you pick needs the same care.)
+
 ### The volume
 
 Flat and read-only: each registration is one file in the volume root, named
@@ -171,8 +183,9 @@ Requests (all may carry a numeric `id`, which is echoed in the reply):
 
 | `type` | fields |
 | --- | --- |
-| `register` | `pipe` (full pipe name), `file_name`, optional `reader_info_suffix`, optional `link_path`, optional `size` |
+| `register` | `pipe` (full pipe name), `file_name`, optional `reader_info_suffix`, optional `link_path`, optional `size`, optional `defer` |
 | `unregister` | `pipe` |
+| `retry_mount` | (none) |
 
 Replies have `"type":"reply"` and `"status":"ok"` or `"error"`. On success
 `size` declares the length of the content in bytes (a whole number from 0 to 1073741824). With it the file
@@ -182,10 +195,20 @@ fails with an I/O error (nothing partial is returned) and an `error` event with 
 pushed. Without `size` the size is 0 until a handle has read, as before. A bad value is refused with
 `bad_request`. The size applies to the registration; to change it, unregister and register again.
 
+`defer` (`true` or `false`, default `false`) accepts the registration even when the driver is not installed or the mount
+fails. The reply then has `"mounted":false`, and the file does not exist yet: opening it fails with file not found until the
+mount appears. The service checks every second while such registrations wait, and when the mount exists it pushes an
+`event` of `mounted` with the `file` name (the reply says `"mounted":true` when it was already mounted, and then no event
+follows). A link made with `link_path` dangles until then and works afterwards. Without `defer`, a missing driver is
+refused at once with `driver_not_installed` and a failed mount with `mount_failed`, as before.
+
+`retry_mount` tries to mount now (an installer that has just installed the driver can say so instead of waiting for the
+next check) and answers `"mounted":true` or `false`.
+
 `register` returns `path` (the file inside the mount) and `linked`. Errors carry
 `code` (`bad_request`, `bad_name`, `pipe_unreachable`, `name_in_use`, `link_refused`,
-`not_found`, `driver_not_installed`, `too_many_registrations`) and a `message`. The service pushes events, `"type":"event"`, with
-`event` of `opened`, `denied` or `error`, plus `file` and `reader_pid`. The event is
+`not_found`, `driver_not_installed`, `mount_failed`, `size_required`, `too_many_registrations`) and a `message`. The service pushes events, `"type":"event"`, with
+`event` of `opened`, `denied`, `error` or `mounted`, plus `file` and (for the first three) `reader_pid`. The event is
 pushed when the content is fetched (the first read), not at open, so browsing a
 folder that contains the file produces none.
 
@@ -207,6 +230,7 @@ in the service's `Parameters` key, as DWORD values) or for a development `run`:
 | `--max-reg-per-user <n>` | 256 | 1 to 100000 | `MaxRegPerUser` |
 | `--max-conn <n>` | 128 | 1 to 10000 | `MaxConn` |
 | `--max-conn-per-user <n>` | 16 | 1 to 10000 | `MaxConnPerUser` |
+| `--idle-seconds <n>` | 30 | 1 to 86400 | `IdleSeconds` |
 
 The service reads them when it starts, so changing a value later means restarting
 the service. A missing value keeps the default; an out-of-range value is logged and
@@ -246,12 +270,10 @@ install the service on a machine that does not have the driver (for example from
 fetches the driver later, only if the user agrees):
 
 - **At start, driver missing:** the service logs one line to `service.log` ("WinFsp is not installed",
-  "Dokan is not installed" or "Windows Projected File System is not installed"), opens **no control pipe**, and stops with exit code 0. The Service Control
-  Manager logs no failure and runs no recovery action. The start type is left alone, so with
-  `install --auto-start` it tries again at every boot. Nothing polls and nothing listens while the driver
-  is missing: **the control pipe does not exist until the driver is installed and the service is started.**
-- **After installing the driver:** start the service again with an elevated
-  `sc start PipeFileService` (or reboot). There is no wake-up message.
+  "Dokan is not installed" or "Windows Projected File System is not installed") and **keeps running with its control
+  pipe open**. `register` is refused with `driver_not_installed`, or, with `defer`, waits (see above). Nothing is mounted.
+- **After installing the driver:** nothing needs restarting. Waiting deferred registrations mount within a second or
+  two, and a plain `register` works from then on; `retry_mount` skips the wait.
 - **Driver removed while the service runs:** `register` answers
   `driver_not_installed` and registers nothing. Registrations that already exist
   are left alone; they stop working by themselves (reads fail) and are cleaned up
@@ -360,7 +382,8 @@ Tests (`tests\service-up.ps1` and `tests\service-down.ps1` run elevated and take
 .\tests\service-down.ps1      # elevated: stop + uninstall + check nothing is left
 ```
 
-`tests\declared-size.ps1` (unelevated, service running) checks the optional `size` of `register`, and
+`tests\idle.ps1` (unelevated; install the service with `tests\service-up.ps1 -IdleSeconds 3`) checks mounting on demand,
+the idle unmount, the open-handle hold, `defer` and `retry_mount`. `tests\declared-size.ps1` (unelevated, service running) checks the optional `size` of `register`, and
 `tests\projfs.ps1` what is specific to the ProjFS service. `tests\limits.ps1` (unelevated, service running) checks the control-pipe limits. `tests\slow-read.ps1`
 (unelevated, service running) checks that a read waiting 20 seconds for the data server succeeds and the
 volume stays mounted.
@@ -553,6 +576,9 @@ drive letter (default `K`). The ProjFS mount tool has no drive letter; `tests\pr
   (see [Backends](#backends-winfsp-dokan-or-projfs)).
 - The volume's security descriptor allows only the current user and SYSTEM, so
   other users cannot trigger reads through the mount tool.
+
+- A Dokan file system started on a connection thread (which ends when its client goes away) crashed `dokan2.dll` on a
+  later unmount or mount, only after several cycles; found by `tests\idle.ps1`. All backend calls now come from one thread.
 
 ## Not done
 

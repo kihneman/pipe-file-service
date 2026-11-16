@@ -249,4 +249,6 @@ const PfsBackend pfs_backend = {
     L"Dokan", "https://github.com/dokan-dev/dokany/releases", installed, start, stop, parse_run_option,
     L"--dokan-dir <folder>",
     L"--dokan-dir makes the Dokan check look for <folder>\\dokan2.dll instead of the real install",
+    FALSE,   // requires_size
+    NULL,    // open_handles
 };

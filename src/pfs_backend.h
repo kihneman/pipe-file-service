@@ -54,7 +54,8 @@ typedef struct {
     // True when the driver is installed. Loads no driver code (the driver library is delay-loaded).
     BOOL (*installed)(void);
     // Loads the driver, creates the volume, mounts it at `mount` and starts serving the core's files.
-    // Returns 0, or a nonzero exit code after logging why it failed. Called once.
+    // Returns 0, or nonzero after logging why it failed. Called each time the core needs the mount (after the first
+    // registration, and again after an idle unmount), and every start is followed by a stop: keep no state between them.
     int (*start)(const WCHAR *mount);
     void (*stop)(void);
     // Backend-specific `run` option (development only). Returns TRUE when it consumed the flag and its value.
@@ -64,6 +65,9 @@ typedef struct {
     // TRUE when the file system needs a file's final size before its first read (a projection into a folder does):
     // `register` then refuses a registration without `size` (code `size_required`).
     BOOL requires_size;
+    // Optional. How many file handles are open on the served files that the core cannot see (a projected folder is
+    // opened by the file system, not through pfs_open); the core does not unmount while there are any. NULL = none.
+    LONG (*open_handles)(void);
 } PfsBackend;
 
 extern const PfsBackend pfs_backend;
