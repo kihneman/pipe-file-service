@@ -120,7 +120,9 @@ gh attestation verify PipeFileService-dokan.exe -R kihneman/pipe-file-service
 ``````
 
 Notes: uninstalling Dokan keeps its driver service until the next restart, and the Dokan installer refuses
-to install again until then.
+to install again until then. The service keeps its control pipe up whether or not the driver is installed, mounts when
+the first registration needs it and unmounts after 30 seconds unused (``--idle-seconds``); ``register`` with
+``defer`` waits for a missing driver and the service sends a ``mounted`` event when the mount exists.
 
 > WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
 > https://github.com/winfsp/winfsp
