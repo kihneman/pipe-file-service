@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <sddl.h>
-#define MOUNT_VERSION "0.7.0"   // scripts/release.ps1 reads this; release tags must match it
+#define MOUNT_VERSION "0.8.0"   // scripts/release.ps1 reads this; release tags must match it
 #define DEFAULT_PATH L"\\property-file.env"
 #define DENIED_PREFIX "Access denied: you do not have permission"
 #define MAX_DEPTH 32
